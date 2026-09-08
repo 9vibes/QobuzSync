@@ -62,7 +62,7 @@ docker compose up --build
 Container image:
 
 ```text
-ghcr.io/9vibes/qobuz-sync
+ghcr.io/9vibes/qobuzsync
 ```
 
 ## Legal
