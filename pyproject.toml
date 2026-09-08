@@ -1,0 +1,37 @@
+[project]
+name = "qobuz-sync"
+version = "0.1.46"
+description = "Self-hosted Qobuz purchased music downloader for Umbrel"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "jinja2>=3.1",
+  "requests>=2.32",
+  "python-multipart>=0.0.9",
+  "mutagen>=1.47",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[tool.bandit]
+skips = ["B104", "B107", "B608"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated.*",
+  "ignore:The anyio.abc.BlockingPortal alias is deprecated.*",
+]
