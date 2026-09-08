@@ -312,6 +312,7 @@ def render_home(
     }}
     .hero-card, section, .umbrel-glass {{
       background: var(--panel);
+      background-clip: padding-box;
       border: 1px solid var(--line);
       border-radius: 32px;
       box-shadow: var(--shadow);
@@ -319,8 +320,12 @@ def render_home(
       -webkit-backdrop-filter: blur(28px) saturate(1.25);
       box-shadow: var(--shadow), var(--glass-inset);
       overflow: hidden;
+      isolation: isolate;
+      contain: paint;
+      clip-path: inset(0 round 32px);
+      transform: translateZ(0);
     }}
-    .hero-card {{ padding: clamp(1rem, 2.6vw, 1.55rem); overflow: hidden; position: relative; isolation: isolate; }}
+    .hero-card {{ padding: clamp(1rem, 2.6vw, 1.55rem); position: relative; }}
     .hero-card::after {{
       content: '';
       position: absolute;
@@ -358,16 +363,20 @@ def render_home(
       cursor: pointer;
       color: #111827;
       background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      background-clip: padding-box;
       box-shadow: 0 14px 32px rgba(245, 158, 11, .28);
+      overflow: hidden;
+      clip-path: inset(0 round 999px);
+      transform: translateZ(0);
       transition: transform .16s ease, box-shadow .16s ease, filter .16s ease;
     }}
     button:hover {{ transform: translateY(-1px) scale(1.01); filter: brightness(1.06); box-shadow: 0 18px 42px rgba(245, 158, 11, .36); }}
     .status-panel {{ grid-column: 1 / -1; padding: .8rem; display: grid; grid-template-columns: auto repeat(3, minmax(0, 1fr)); align-items: center; gap: .65rem; }}
-    .status-pill {{ display: inline-flex; align-items: center; gap: .4rem; width: fit-content; padding: .38rem .62rem; border-radius: 999px; font-size: .9rem; font-weight: 800; }}
+    .status-pill {{ display: inline-flex; align-items: center; gap: .4rem; width: fit-content; padding: .38rem .62rem; border-radius: 999px; font-size: .9rem; font-weight: 800; background-clip: padding-box; overflow: hidden; clip-path: inset(0 round 999px); transform: translateZ(0); }}
     .status-pill::before {{ content: ''; width: .55rem; height: .55rem; border-radius: 999px; background: currentColor; box-shadow: 0 0 18px currentColor; }}
     .ready {{ color: var(--green); background: rgba(52, 211, 153, .12); }}
     .needs-setup {{ color: var(--accent); background: rgba(245, 158, 11, .13); }}
-    .stat {{ padding: .68rem .78rem; border-radius: 18px; background: rgba(255, 255, 255, .07); border: 1px solid rgba(255,255,255,.12); box-shadow: var(--glass-inset); }}
+    .stat {{ padding: .68rem .78rem; border-radius: 18px; background: rgba(255, 255, 255, .07); background-clip: padding-box; border: 1px solid rgba(255,255,255,.12); box-shadow: var(--glass-inset); overflow: hidden; isolation: isolate; clip-path: inset(0 round 18px); }}
     .stat small {{ display: block; color: var(--muted); text-transform: uppercase; letter-spacing: .12em; font-size: .61rem; font-weight: 800; }}
     .stat strong {{ display: block; margin-top: .18rem; font-size: 1.05rem; }}
     .tabs {{ margin-bottom: 1rem; }}
@@ -380,8 +389,12 @@ def render_home(
       border: 1px solid var(--line);
       border-radius: 999px;
       background: rgba(0, 0, 0, .26);
+      background-clip: padding-box;
       box-shadow: inset 0 1px 0 rgba(255, 255, 255, .07);
       backdrop-filter: blur(22px);
+      overflow: hidden;
+      clip-path: inset(0 round 999px);
+      transform: translateZ(0);
     }}
     .tab-list label {{
       margin: 0;
@@ -389,6 +402,9 @@ def render_home(
       border-radius: 999px;
       color: var(--muted);
       cursor: pointer;
+      background-clip: padding-box;
+      overflow: hidden;
+      clip-path: inset(0 round 999px);
       transition: color .15s, background .15s, box-shadow .15s;
     }}
     #tab-library:checked ~ .tab-list label[for="tab-library"],
@@ -413,8 +429,12 @@ def render_home(
       border-radius: 16px;
       border: 1px solid rgba(255, 255, 255, .12);
       background: rgba(5, 7, 12, .54);
+      background-clip: padding-box;
       color: #fff;
       outline: none;
+      overflow: hidden;
+      clip-path: inset(0 round 16px);
+      transform: translateZ(0);
       transition: border-color .15s, box-shadow .15s, background .15s;
     }}
     input:focus, select:focus {{ border-color: rgba(245, 158, 11, .7); box-shadow: 0 0 0 4px rgba(245, 158, 11, .13); background: rgba(5, 7, 12, .84); }}
@@ -442,9 +462,9 @@ def render_home(
     }}
     select option {{ background: #111827; color: #f8fafc; }}
     .checks {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; margin: 1rem 0; }}
-    .checks label {{ display: flex; align-items: center; gap: .55rem; padding: .75rem; border-radius: 16px; background: rgba(255, 255, 255, .065); border: 1px solid var(--line); box-shadow: var(--glass-inset); }}
+    .checks label {{ display: flex; align-items: center; gap: .55rem; padding: .75rem; border-radius: 16px; background: rgba(255, 255, 255, .065); background-clip: padding-box; border: 1px solid var(--line); box-shadow: var(--glass-inset); overflow: hidden; clip-path: inset(0 round 16px); }}
     .checks input {{ width: 1.05rem; height: 1.05rem; accent-color: var(--accent); }}
-    .notice {{ border-left: 3px solid var(--accent); padding: .8rem .95rem; border-radius: 14px; background: rgba(245, 158, 11, .10); color: #fde68a; }}
+    .notice {{ border-left: 3px solid var(--accent); padding: .8rem .95rem; border-radius: 14px; background: rgba(245, 158, 11, .10); background-clip: padding-box; color: #fde68a; overflow: hidden; isolation: isolate; clip-path: inset(0 round 14px); }}
     .notice p {{ margin: 0 0 .65rem; color: #fde68a; }}
     .notice ol {{ margin: .55rem 0 .65rem 1.25rem; padding: 0; color: #fde68a; }}
     .notice li {{ margin: .28rem 0; }}
@@ -462,7 +482,7 @@ def render_home(
     .progress-meter {{ width: 100%; height: .7rem; overflow: hidden; border-radius: 999px; background: rgba(5, 7, 12, .7); border: 1px solid rgba(255,255,255,.08); background-clip: padding-box; clip-path: inset(0 round 999px); transform: translateZ(0); }}
     .progress-fill {{ height: 100%; border-radius: inherit; background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: 0 0 22px rgba(245, 158, 11, .38); transition: width .25s ease; }}
     .sync-detail-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .6rem; margin-top: .85rem; }}
-    .sync-detail {{ padding: .72rem; border-radius: 14px; background: rgba(5, 7, 12, .42); border: 1px solid rgba(255,255,255,.075); }}
+    .sync-detail {{ padding: .72rem; border-radius: 14px; background: rgba(5, 7, 12, .42); background-clip: padding-box; border: 1px solid rgba(255,255,255,.075); overflow: hidden; clip-path: inset(0 round 14px); }}
     .sync-detail small {{ display: block; color: var(--muted); text-transform: uppercase; letter-spacing: .12em; font-size: .62rem; font-weight: 850; }}
     .sync-detail strong {{ display: block; margin-top: .22rem; color: var(--text); }}
     .section-head {{ display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; margin-bottom: 1rem; }}
@@ -489,10 +509,10 @@ def render_home(
     .track-copy h3 {{ margin: 0; color: var(--text); font-size: 1.03rem; letter-spacing: -.025em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
     .track-copy p {{ margin: .18rem 0 .45rem; color: rgba(255,255,255,.78); line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
     .track-meta {{ display: flex; flex-wrap: wrap; gap: .42rem; color: var(--muted); font-size: .78rem; }}
-    .track-meta span {{ padding: .24rem .48rem; border-radius: 999px; background: rgba(0,0,0,.22); border: 1px solid rgba(255,255,255,.08); }}
+    .track-meta span {{ padding: .24rem .48rem; border-radius: 999px; background: rgba(0,0,0,.22); background-clip: padding-box; border: 1px solid rgba(255,255,255,.08); overflow: hidden; clip-path: inset(0 round 999px); }}
     .track-card-progress {{ grid-column: 1 / -1; margin-top: -.2rem; }}
     .track-progress-caption {{ display: flex; justify-content: space-between; gap: .75rem; margin-bottom: .35rem; color: var(--muted); font-size: .78rem; }}
-    .kind-badge {{ display: inline-flex; padding: .25rem .55rem; border-radius: 999px; background: rgba(245, 158, 11, .14); color: #fbbf24; font-weight: 800; }}
+    .kind-badge {{ display: inline-flex; padding: .25rem .55rem; border-radius: 999px; background: rgba(245, 158, 11, .14); background-clip: padding-box; color: #fbbf24; font-weight: 800; overflow: hidden; clip-path: inset(0 round 999px); }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #cbd5e1; }}
     .path {{ color: #cbd5e1; word-break: break-all; }}
     .empty {{ text-align: center; color: var(--muted); border-radius: 16px !important; }}

@@ -24,9 +24,14 @@ def test_status_page_loads_with_no_configuration(tmp_path, monkeypatch):
     assert "Monitor purchased albums and tracks, sync them to your Umbrel Downloads/QobuzSync folder, and keep artwork, and metadata in one place for Navidrome or your preferred music server to digest." in response.text
     assert "one polished glass dashboard" not in response.text
     assert "overflow: hidden" in response.text
+    assert "clip-path: inset(0 round 32px)" in response.text
     assert "clip-path: inset(0 round 24px)" in response.text
+    assert "clip-path: inset(0 round 18px)" in response.text
+    assert "clip-path: inset(0 round 16px)" in response.text
+    assert "clip-path: inset(0 round 14px)" in response.text
     assert "clip-path: inset(0 round 999px)" in response.text
     assert "background-clip: padding-box" in response.text
+    assert "contain: paint" in response.text
     assert 'id="sync-now-form"' in response.text
     assert "event.preventDefault()" in response.text
     assert "fetch(syncForm.action" in response.text
