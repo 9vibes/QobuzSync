@@ -48,11 +48,6 @@ class QobuzWebCredentials:
     secrets: tuple[str, ...]
 
 
-def md5_password(password: str) -> str:
-    """Qobuz web clients submit the MD5 hex digest of the password."""
-    return hashlib.md5(password.encode("utf-8"), usedforsecurity=False).hexdigest()
-
-
 def discover_web_credentials(session: requests.Session | None = None, timeout: int = 30) -> QobuzWebCredentials:
     """Discover Qobuz web app id and request-signing secrets from the public web bundle.
 
@@ -137,16 +132,13 @@ class QobuzClient:
 
     def login(
         self,
-        email: str = "",
-        password_md5: str = "",
         *,
         user_id: str = "",
         user_auth_token: str = "",
     ) -> LoginResult:
-        if user_id and user_auth_token:
-            payload = self._get("user/login", user_id=user_id, user_auth_token=user_auth_token, app_id=self.app_id)
-        else:
-            payload = self._get("user/login", email=email, password=password_md5, app_id=self.app_id)
+        if not (user_id and user_auth_token):
+            raise AuthenticationError("Qobuz user ID and auth token are required")
+        payload = self._get("user/login", user_id=user_id, user_auth_token=user_auth_token, app_id=self.app_id)
         token = payload.get("user_auth_token")
         if not token:
             raise AuthenticationError("Qobuz login did not return a user auth token")

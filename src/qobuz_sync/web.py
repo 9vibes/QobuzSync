@@ -13,7 +13,6 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from .qobuz_client import md5_password
 from .state import AppConfig, DEFAULT_DOWNLOAD_DIR, SyncState
 from .sync import SyncService
 
@@ -182,8 +181,6 @@ def create_app() -> FastAPI:
 
     @app.post("/settings")
     def save_settings(
-        qobuz_email: str = Form(""),
-        qobuz_password: str = Form(""),
         qobuz_localuser: str = Form(""),
         qobuz_user_id: str = Form(""),
         qobuz_user_auth_token: str = Form(""),
@@ -195,18 +192,12 @@ def create_app() -> FastAPI:
     ) -> RedirectResponse:
         current = state.load_config()
         pasted_user_id, pasted_auth_token, pasted_email = parse_qobuz_localuser(qobuz_localuser)
-        email = qobuz_email.strip() or current.qobuz_email
-        if not email and pasted_email:
-            email = pasted_email
-        password = qobuz_password.strip() or current.qobuz_password
-        password_md5 = md5_password(password) if password else current.qobuz_password_md5
+        email = pasted_email or current.qobuz_email
         user_id = qobuz_user_id.strip() or pasted_user_id or current.qobuz_user_id
         auth_token = qobuz_user_auth_token.strip() or pasted_auth_token or current.qobuz_user_auth_token
         state.save_config(
             AppConfig(
                 qobuz_email=email,
-                qobuz_password=password,
-                qobuz_password_md5=password_md5,
                 qobuz_user_id=user_id,
                 qobuz_user_auth_token=auth_token,
                 download_dir=DEFAULT_DOWNLOAD_DIR,
@@ -329,8 +320,7 @@ def render_home(
     if progress_total:
         progress_percent = max(0, min(100, round((progress_current / progress_total) * 100)))
     sync_badge = latest_status if latest else "Waiting"
-    password_note = "Saved password hash is stored; enter a new password to replace it." if config.qobuz_password_md5 else "Password is converted to a Qobuz-compatible hash before storage."
-    token_note = "Saved token is stored; enter a new token to replace it." if config.qobuz_user_auth_token else "Use when Qobuz blocks password API login."
+    token_note = "Saved token is stored; enter a new token to replace it." if config.qobuz_user_auth_token else "Required with Qobuz user ID."
     localuser_note = "Paste the full localuser value from Qobuz Web Player to fill user ID and token automatically."
     # Render a static HTML template with escaped dynamic values; this is not a SQL query.
     return f"""
@@ -632,8 +622,6 @@ def render_home(
             <h2>Settings</h2>
             <form method="post" action="/settings">
               <div class="field-grid">
-                <label><span>Qobuz email</span><input name="qobuz_email" type="email" value="{escape(config.qobuz_email)}" autocomplete="username"></label>
-                <label><span>Qobuz password</span><input name="qobuz_password" type="password" autocomplete="current-password" value="" placeholder="{password_note}"></label>
                 <label class="wide-field"><span>Paste Qobuz browser session</span><input name="qobuz_localuser" type="password" autocomplete="off" value="" placeholder="{localuser_note}"></label>
                 <label><span>Qobuz user ID</span><input name="qobuz_user_id" value="{escape(config.qobuz_user_id)}" placeholder="Required with auth token"></label>
                 <label><span>User auth token</span><input name="qobuz_user_auth_token" type="password" autocomplete="off" value="" placeholder="{token_note}"></label>
@@ -672,7 +660,7 @@ def render_home(
               </div>
             </div>
             <div class="notice">
-              <p>Easiest login: use Qobuz in your browser, then paste its browser session here. This avoids Qobuz's captcha-prone username/password API login.</p>
+              <p>Login: use Qobuz in your browser, then paste its browser session here.</p>
               <ol>
                 <li>Log in to the Qobuz Web Player.</li>
                 <li>Open your browser’s Developer Tools / Inspect Element, then choose Console.</li>
@@ -1006,8 +994,6 @@ def logged_in_qobuz_client(state: SyncState | None) -> object | None:
     try:
         client = SyncService(state)._build_client()
         client.login(
-            config.qobuz_email,
-            config.qobuz_password_md5,
             user_id=config.qobuz_user_id,
             user_auth_token=config.qobuz_user_auth_token,
         )
@@ -1108,8 +1094,6 @@ def recover_cover_from_qobuz(state: SyncState, kind: str, purchase_id: str, path
     try:
         client = SyncService(state)._build_client()
         client.login(
-            config.qobuz_email,
-            config.qobuz_password_md5,
             user_id=config.qobuz_user_id,
             user_auth_token=config.qobuz_user_auth_token,
         )

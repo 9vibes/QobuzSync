@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.49
+
+- Removes the broken Qobuz email/password login flow from the UI and sync client.
+- Requires Qobuz Web Player browser-session credentials (`localuser`, or user ID plus auth token) for sync.
+- Clears and ignores legacy saved password hashes so they cannot configure login.
+
 ## 0.1.48
 
 - Removes the "running without an access token" security notice from the dashboard (the optional `QOBUZ_SYNC_AUTH_TOKEN` login still works if you set it).

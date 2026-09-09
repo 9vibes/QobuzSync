@@ -65,8 +65,10 @@ def test_status_page_loads_with_no_configuration(tmp_path, monkeypatch):
     assert 'id="tab-library" checked' in response.text
     assert 'id="tab-settings"' in response.text
     assert "Settings &amp; status" in response.text
-    assert "Easiest login: use Qobuz in your browser" in response.text
+    assert "Login: use Qobuz in your browser" in response.text
     assert 'name="qobuz_localuser" type="password" autocomplete="off" value=""' in response.text
+    assert 'name="qobuz_email"' not in response.text
+    assert 'name="qobuz_password"' not in response.text
     assert "Open your browser’s Developer Tools / Inspect Element" in response.text
     assert "copy(localStorage.getItem('localuser'))" in response.text
     assert "Qobuz Web Player → <code>localuser</code>" in response.text
@@ -81,8 +83,6 @@ def test_settings_can_be_saved_from_browser_form(tmp_path, monkeypatch):
     client = TestClient(app)
 
     response = client.post("/settings", data={
-        "qobuz_email": "me@example.com",
-        "qobuz_password": "secret",
         "qobuz_user_id": "123",
         "qobuz_user_auth_token": "uat-123",
         "quality": "6",
@@ -94,10 +94,10 @@ def test_settings_can_be_saved_from_browser_form(tmp_path, monkeypatch):
 
     assert response.status_code == 303
     home = client.get("/")
-    assert "me@example.com" in home.text
-    assert 'name="qobuz_password" type="password" autocomplete="current-password" value=""' in home.text
+    assert "me@example.com" not in home.text
+    assert 'name="qobuz_email"' not in home.text
+    assert 'name="qobuz_password"' not in home.text
     assert "secret" not in home.text
-    assert "Saved password hash is stored; enter a new password to replace it." in home.text
     assert "123" in home.text
     assert 'name="qobuz_user_auth_token" type="password" autocomplete="off" value=""' in home.text
     assert "uat-123" not in home.text
@@ -488,8 +488,6 @@ def test_settings_preserve_saved_login_fields_when_blank(tmp_path, monkeypatch):
     client = TestClient(app)
 
     first = client.post("/settings", data={
-        "qobuz_email": "me@example.com",
-        "qobuz_password": "secret",
         "qobuz_user_id": "123",
         "qobuz_user_auth_token": "uat-123",
         "quality": "6",
@@ -507,9 +505,9 @@ def test_settings_preserve_saved_login_fields_when_blank(tmp_path, monkeypatch):
     assert first.status_code == 303
     assert second.status_code == 303
     home = client.get("/")
-    assert "me@example.com" in home.text
+    assert 'name="qobuz_email"' not in home.text
+    assert 'name="qobuz_password"' not in home.text
     assert 'value="secret"' not in home.text
-    assert "Saved password hash is stored; enter a new password to replace it." in home.text
     assert 'value="123"' in home.text
     assert "Saved token is stored; enter a new token to replace it." in home.text
     assert 'value="uat-123"' not in home.text
@@ -521,8 +519,8 @@ def test_album_and_track_filters_can_be_disabled_from_browser_form(tmp_path, mon
     client = TestClient(app)
 
     response = client.post("/settings", data={
-        "qobuz_email": "me@example.com",
-        "qobuz_password": "secret",
+        "qobuz_user_id": "123",
+        "qobuz_user_auth_token": "uat-123",
         "quality": "6",
         "interval_minutes": "120",
     }, follow_redirects=False)
@@ -548,6 +546,8 @@ def test_sync_now_can_start_without_full_page_refresh(tmp_path, monkeypatch):
         def start(self):
             started.append((self.target, self.daemon))
 
+    import threading
+    monkeypatch.setattr("qobuz_sync.web.SYNC_JOB_LOCK", threading.Lock())
     monkeypatch.setattr("qobuz_sync.web.threading.Thread", FakeThread)
     app = create_app()
     client = TestClient(app)
@@ -580,6 +580,8 @@ def test_resync_all_starts_in_background_for_live_library_refresh(tmp_path, monk
         def start(self):
             started.append((self.target, self.daemon))
 
+    import threading
+    monkeypatch.setattr("qobuz_sync.web.SYNC_JOB_LOCK", threading.Lock())
     monkeypatch.setattr("qobuz_sync.web.SyncService", FakeSyncService)
     monkeypatch.setattr("qobuz_sync.web.threading.Thread", FakeThread)
     app = create_app()

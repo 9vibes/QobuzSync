@@ -27,7 +27,7 @@ class AppConfig:
 
     @property
     def is_configured(self) -> bool:
-        return bool((self.qobuz_email and self.qobuz_password_md5) or (self.qobuz_user_id and self.qobuz_user_auth_token))
+        return bool(self.qobuz_user_id and self.qobuz_user_auth_token)
 
 
 class SyncState:
@@ -39,10 +39,8 @@ class SyncState:
     def save_config(self, config: AppConfig) -> None:
         rows = {
             "qobuz_email": config.qobuz_email,
-            # Only the Qobuz API-required MD5 digest is needed after save.
-            # Do not persist the plaintext password or render it back later.
             "qobuz_password": CLEARED_SENSITIVE_VALUE,
-            "qobuz_password_md5": config.qobuz_password_md5,
+            "qobuz_password_md5": CLEARED_SENSITIVE_VALUE,
             "qobuz_user_id": config.qobuz_user_id,
             "qobuz_user_auth_token": config.qobuz_user_auth_token,
             "download_dir": DEFAULT_DOWNLOAD_DIR,
@@ -64,7 +62,7 @@ class SyncState:
         return AppConfig(
             qobuz_email=values.get("qobuz_email", ""),
             qobuz_password=CLEARED_SENSITIVE_VALUE,
-            qobuz_password_md5=values.get("qobuz_password_md5", ""),
+            qobuz_password_md5=CLEARED_SENSITIVE_VALUE,
             qobuz_user_id=values.get("qobuz_user_id", ""),
             qobuz_user_auth_token=values.get("qobuz_user_auth_token", ""),
             # Download location is fixed. /downloads is mounted to Umbrel's
@@ -274,6 +272,7 @@ class SyncState:
                 """
             )
             con.execute("update config set value = ? where key = ?", (CLEARED_SENSITIVE_VALUE, "qobuz_password"))
+            con.execute("update config set value = ? where key = ?", (CLEARED_SENSITIVE_VALUE, "qobuz_password_md5"))
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_path, timeout=30)

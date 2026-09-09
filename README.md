@@ -30,7 +30,7 @@ This repo is only the app source and container build. Umbrel app-store files liv
 
 ## Qobuz login
 
-Qobuz username/password API login can be blocked by captcha or web-login protections. The friendlier fallback is to paste your existing Qobuz Web Player browser session into the app.
+Qobuz Sync uses your existing Qobuz Web Player browser session. Email/password API login is not supported because Qobuz can block it with captcha or web-login protections.
 
 1. Log in to the Qobuz Web Player.
 2. Open Developer Tools / Inspect Element, then choose Console.

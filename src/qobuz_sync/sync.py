@@ -29,7 +29,7 @@ def _safe_message(exc: Exception) -> str:
 
 
 class PurchaseClient(Protocol):
-    def login(self, email: str, password_md5: str, *, user_id: str = "", user_auth_token: str = ""): ...
+    def login(self, *, user_id: str = "", user_auth_token: str = ""): ...
     def list_owned_items(self, *, include_albums: bool = True, include_tracks: bool = True) -> list[dict[str, str]]: ...
     def download_owned_item(self, item: dict[str, str], download_dir: str | Path, quality: int, *, include_extras: bool = True, progress_callback: Callable[[int, int, str], None] | None = None, track_progress_callback: Callable[[str, str, str, str, int, int, str], None] | None = None) -> Path: ...
     def download_owned_item_extras(self, item: dict[str, str], downloaded_path: str | Path) -> list[Path]: ...
@@ -51,8 +51,6 @@ class SyncService:
             self.state.set_progress(phase="login", message="Signing in to Qobuz", current=0, total=0)
             client = self.client or self._build_client()
             client.login(
-                config.qobuz_email,
-                config.qobuz_password_md5,
                 user_id=config.qobuz_user_id,
                 user_auth_token=config.qobuz_user_auth_token,
             )

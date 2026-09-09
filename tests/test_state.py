@@ -24,7 +24,7 @@ def test_config_round_trips_to_sqlite(tmp_path: Path):
     assert loaded == AppConfig(
         qobuz_email="me@example.com",
         qobuz_password="",
-        qobuz_password_md5="abc123",
+        qobuz_password_md5="",
         qobuz_user_id="123",
         qobuz_user_auth_token="uat-123",
         download_dir=DEFAULT_DOWNLOAD_DIR,
@@ -51,7 +51,7 @@ def test_legacy_plaintext_password_is_scrubbed_on_startup(tmp_path: Path):
     reloaded = SyncState(db_path).load_config()
 
     assert reloaded.qobuz_password == ""
-    assert reloaded.qobuz_password_md5 == "abc123"
+    assert reloaded.qobuz_password_md5 == ""
     assert reloaded.qobuz_user_auth_token == "uat-123"
     with sqlite3.connect(db_path) as con:
         stored = con.execute("select value from config where key = ?", ("qobuz_password",)).fetchone()[0]
@@ -60,6 +60,10 @@ def test_legacy_plaintext_password_is_scrubbed_on_startup(tmp_path: Path):
 
 def test_configured_with_qobuz_auth_token_without_password():
     assert AppConfig(qobuz_user_id="123", qobuz_user_auth_token="uat-123").is_configured is True
+
+
+def test_email_password_hash_does_not_configure_qobuz_login():
+    assert AppConfig(qobuz_email="me@example.com", qobuz_password_md5="abc123").is_configured is False
 
 
 def test_album_art_and_extras_default_on(tmp_path: Path):

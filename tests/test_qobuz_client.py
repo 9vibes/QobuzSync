@@ -1,6 +1,6 @@
-import hashlib
+import pytest
 
-from qobuz_sync.qobuz_client import QobuzClient, md5_password
+from qobuz_sync.qobuz_client import AuthenticationError, QobuzClient
 
 
 class FakeResponse:
@@ -32,10 +32,6 @@ class FakeSession:
         return self.responses.pop(0)
 
 
-def test_md5_password_hashes_plaintext_for_qobuz_login():
-    assert md5_password("correct horse") == hashlib.md5(b"correct horse").hexdigest()
-
-
 def test_login_stores_user_auth_token_and_membership_label():
     session = FakeSession()
     session.queue({
@@ -44,7 +40,7 @@ def test_login_stores_user_auth_token_and_membership_label():
     })
     client = QobuzClient("app-1", session=session)
 
-    result = client.login("me@example.com", "already-md5")
+    result = client.login(user_id="123", user_auth_token="uat-existing")
 
     assert result.membership == "Sublime"
     assert client.user_auth_token == "uat-123"
@@ -52,10 +48,17 @@ def test_login_stores_user_auth_token_and_membership_label():
     assert session.headers["X-User-Auth-Token"] == "uat-123"
     assert session.calls[0]["url"].endswith("/user/login")
     assert session.calls[0]["params"] == {
-        "email": "me@example.com",
-        "password": "already-md5",
+        "user_id": "123",
+        "user_auth_token": "uat-existing",
         "app_id": "app-1",
     }
+
+
+def test_login_rejects_missing_browser_session_credentials():
+    client = QobuzClient("app-1", session=FakeSession())
+
+    with pytest.raises(AuthenticationError, match="user ID and auth token are required"):
+        client.login()
 
 
 def test_login_can_use_existing_user_auth_token():
@@ -86,7 +89,7 @@ def test_login_accepts_purchased_music_accounts_without_subscription_credentials
     })
     client = QobuzClient("app-1", session=session)
 
-    result = client.login("me@example.com", "already-md5")
+    result = client.login(user_id="123", user_auth_token="uat-existing")
 
     assert result.membership == "Purchased music account"
     assert client.user_auth_token == "uat-123"

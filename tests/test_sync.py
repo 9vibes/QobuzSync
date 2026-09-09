@@ -13,8 +13,8 @@ class FakePurchaseClient:
         self.download_calls = []
         self.extra_calls = []
 
-    def login(self, email: str, password_md5: str, *, user_id: str = "", user_auth_token: str = ""):
-        self.login_calls.append((email, password_md5, user_id, user_auth_token))
+    def login(self, *, user_id: str = "", user_auth_token: str = ""):
+        self.login_calls.append((user_id, user_auth_token))
 
     def list_owned_items(self, *, include_albums: bool = True, include_tracks: bool = True):
         return [
@@ -39,7 +39,7 @@ class FakePurchaseClient:
 
 def test_sync_once_downloads_only_new_purchases(tmp_path: Path):
     state = SyncState(tmp_path / "state.db")
-    state.save_config(AppConfig(qobuz_email="me@example.com", qobuz_password_md5="hash", download_dir=str(tmp_path / "music")))
+    state.save_config(AppConfig(qobuz_user_id="123", qobuz_user_auth_token="uat-123", download_dir=str(tmp_path / "music")))
     client = FakePurchaseClient(tmp_path)
     service = SyncService(state, client=client)
 
@@ -53,7 +53,7 @@ def test_sync_once_downloads_only_new_purchases(tmp_path: Path):
     assert second["found"] == 2
     assert second["downloaded"] == 0
     assert len(client.download_calls) == 2
-    assert client.login_calls[0] == ("me@example.com", "hash", "", "")
+    assert client.login_calls[0] == ("123", "uat-123")
     assert all(call[1] == DEFAULT_DOWNLOAD_DIR for call in client.download_calls)
     assert all(call[3] is True for call in client.download_calls)
     assert len(state.list_downloads()) == 2
@@ -84,7 +84,7 @@ def test_sync_passes_existing_qobuz_auth_token_to_client(tmp_path: Path):
     result = SyncService(state, client=client).sync_once()
 
     assert result["success"] is True
-    assert client.login_calls[0] == ("", "", "123", "uat-123")
+    assert client.login_calls[0] == ("123", "uat-123")
 
 
 def test_sync_backfills_album_art_and_extras_for_existing_downloads(tmp_path: Path):
