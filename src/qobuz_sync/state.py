@@ -276,6 +276,8 @@ class SyncState:
             con.execute("update config set value = ? where key = ?", (CLEARED_SENSITIVE_VALUE, "qobuz_password"))
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.db_path)
+        con = sqlite3.connect(self.db_path, timeout=30)
         con.row_factory = sqlite3.Row
+        con.execute("pragma journal_mode=wal")
+        con.execute("pragma busy_timeout=30000")
         return con

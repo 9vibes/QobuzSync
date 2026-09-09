@@ -6,6 +6,9 @@ services:
     environment:
       QOBUZ_SYNC_DATA_DIR: /data
       QOBUZ_SYNC_BACKGROUND: "1"
+      # Protects the dashboard when the port is reachable from the network.
+      # Generate one with e.g.: openssl rand -hex 16
+      QOBUZ_SYNC_AUTH_TOKEN: ${QOBUZ_SYNC_AUTH_TOKEN:-}
       # Optional: pin Qobuz web credentials if automatic discovery breaks.
       # QOBUZ_APP_ID: ""
       # QOBUZ_SECRETS: "comma,separated,secrets"

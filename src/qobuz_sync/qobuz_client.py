@@ -496,27 +496,35 @@ class QobuzClient:
         """
         url = self.get_track_file_url(track_id, quality)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with self.session.get(url, stream=True, timeout=self.timeout) as response:  # type: ignore[attr-defined]
-            response.raise_for_status()
-            total = int(response.headers.get("content-length") or 0)
-            downloaded = 0
-            with destination.open("wb") as handle:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
-                        downloaded += len(chunk)
-                        if progress_callback:
-                            progress_callback(downloaded, total)
+        try:
+            with self.session.get(url, stream=True, timeout=self.timeout) as response:  # type: ignore[attr-defined]
+                response.raise_for_status()
+                total = int(response.headers.get("content-length") or 0)
+                downloaded = 0
+                with destination.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_callback:
+                                progress_callback(downloaded, total)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
         return destination
 
     def download_url_file(self, url: str, destination: Path) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with self.session.get(url, stream=True, timeout=self.timeout) as response:  # type: ignore[attr-defined]
-            response.raise_for_status()
-            with destination.open("wb") as handle:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
+        try:
+            with self.session.get(url, stream=True, timeout=self.timeout) as response:  # type: ignore[attr-defined]
+                response.raise_for_status()
+                with destination.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
         return destination
 
     def _get(self, endpoint: str, **params: Any) -> dict[str, Any]:

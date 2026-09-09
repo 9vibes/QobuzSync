@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hmac
 import json
 import mimetypes
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -16,6 +19,20 @@ from .sync import SyncService
 
 
 SYNC_JOB_LOCK = threading.Lock()
+AUTH_COOKIE_NAME = "qobuz_sync_session"
+_QOBUZ_CLIENT_CACHE: tuple[float, object | None] | None = None
+_ART_RECOVERY_CACHE: dict[str, float] = {}
+_ART_RECOVERY_LOCK = threading.Lock()
+_ART_RECOVERY_TTL_SECONDS = 3600
+
+
+def auth_token() -> str:
+    """Access token enforced by the web UI when QOBUZ_SYNC_AUTH_TOKEN is set.
+
+    When unset the app stays open so the trusted Umbrel reverse proxy can keep
+    authenticating for it. Deploy behind a trusted proxy or set the token.
+    """
+    return os.environ.get("QOBUZ_SYNC_AUTH_TOKEN", "").strip()
 
 
 def data_dir() -> Path:
@@ -41,9 +58,55 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Qobuz Sync", lifespan=lifespan)
 
+    @app.middleware("http")
+    async def security_middleware(request: Request, call_next):
+        if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+            origin = request.headers.get("origin", "")
+            if origin:
+                try:
+                    origin_host = urlparse(origin).hostname or ""
+                except ValueError:
+                    origin_host = ""
+                request_host = (request.headers.get("host", "") or "").split(":")[0]
+                if origin_host and origin_host not in {request_host, request.url.hostname}:
+                    return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
+        if request.url.path in {"/health", "/login"}:
+            return await call_next(request)
+        configured_token = auth_token()
+        if configured_token:
+            provided = (request.headers.get("authorization", "") or "").removeprefix("Bearer ").strip()
+            if not provided:
+                provided = request.headers.get("x-api-key", "")
+            if not provided:
+                provided = request.cookies.get(AUTH_COOKIE_NAME, "")
+            if not (provided and hmac.compare_digest(provided, configured_token)):
+                if "text/html" in request.headers.get("accept", ""):
+                    return RedirectResponse("/login", status_code=303)
+                return JSONResponse({"detail": "Authentication required"}, status_code=401)
+        return await call_next(request)
+
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/login", response_class=HTMLResponse)
+    def login_page() -> str:
+        return render_login()
+
+    @app.post("/login")
+    def login_submit(token: str = Form("")) -> Response:
+        configured_token = auth_token()
+        if not configured_token or not (token and hmac.compare_digest(token.strip(), configured_token)):
+            return HTMLResponse(render_login(error="Incorrect access token"), status_code=401)
+        response = RedirectResponse("/", status_code=303)
+        response.set_cookie(AUTH_COOKIE_NAME, configured_token, httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
+        return response
+
+    @app.post("/logout")
+    def logout() -> Response:
+        response = RedirectResponse("/", status_code=303)
+        response.delete_cookie(AUTH_COOKIE_NAME)
+        return response
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request) -> str:
@@ -53,7 +116,15 @@ def create_app() -> FastAPI:
         total_downloads = state.count_downloads()
         progress = state.latest_progress()
         track_progress = build_track_progress_rows(state)
-        return render_home(config, latest, downloads, total_downloads=total_downloads, progress=progress, track_progress=track_progress)
+        return render_home(
+            config,
+            latest,
+            downloads,
+            total_downloads=total_downloads,
+            progress=progress,
+            track_progress=track_progress,
+            auth_configured=bool(auth_token()),
+        )
 
     @app.get("/art/{kind}/{purchase_id}")
     def download_art(kind: str, purchase_id: str):
@@ -68,7 +139,7 @@ def create_app() -> FastAPI:
                 data, media_type = embedded
                 return Response(data, media_type=media_type)
         if art is None:
-            art = recover_cover_from_qobuz(state, kind, purchase_id, download_path)
+            art = cached_recover_cover(state, kind, purchase_id, download_path)
         if art is None:
             title = download_title(state, kind, purchase_id)
             return Response(fallback_cover_svg(title or purchase_id, kind), media_type="image/svg+xml")
@@ -161,7 +232,6 @@ def create_app() -> FastAPI:
             if "application/json" in request.headers.get("accept", ""):
                 return JSONResponse({"started": False, "message": "A sync is already running"}, status_code=409)
             return RedirectResponse("/", status_code=303)
-        SYNC_JOB_LOCK.release()
         threading.Thread(target=run_sync, daemon=True).start()
         if "application/json" in request.headers.get("accept", ""):
             return {"started": True, "message": "Sync started"}
@@ -231,6 +301,7 @@ def render_home(
     total_downloads: int | None = None,
     progress: dict | None = None,
     track_progress: list[dict] | None = None,
+    auth_configured: bool = True,
 ) -> str:
     configured = "Configured" if config.is_configured else "Not configured"
     status_class = "ready" if config.is_configured else "needs-setup"
@@ -263,6 +334,15 @@ def render_home(
     password_note = "Saved password hash is stored; enter a new password to replace it." if config.qobuz_password_md5 else "Password is converted to a Qobuz-compatible hash before storage."
     token_note = "Saved token is stored; enter a new token to replace it." if config.qobuz_user_auth_token else "Use when Qobuz blocks password API login."
     localuser_note = "Paste the full localuser value from Qobuz Web Player to fill user ID and token automatically."
+    auth_notice = (
+        ""
+        if auth_configured
+        else (
+            '<div class="notice"><p><strong>Security notice:</strong> this dashboard is running without an access '
+            "token. Set the <code>QOBUZ_SYNC_AUTH_TOKEN</code> environment variable (or keep it behind Umbrel's "
+            "authenticated proxy) before exposing the app to your network.</p></div>"
+        )
+    )
     # Render a static HTML template with escaped dynamic values; this is not a SQL query.
     return f"""
 <!doctype html>
@@ -533,6 +613,7 @@ def render_home(
           <form id="sync-now-form" class="sync-form" method="post" action="/sync-now"><button id="sync-now-button" type="submit">Sync now</button><span id="sync-now-check" class="sync-check" aria-live="polite" aria-label="Sync started">✓</span></form>
           <form id="resync-all-form" class="sync-form" method="post" action="/resync-all"><button id="resync-all-button" class="danger-button" type="submit">Re Sync Entire Library</button><span id="resync-all-check" class="sync-check" aria-live="polite" aria-label="Entire library re-synced">✓</span></form>
         </div>
+        {auth_notice}
       </div>
     </div>
     <aside class="status-panel hero-card">
@@ -598,7 +679,7 @@ def render_home(
               <div class="progress-meter" aria-label="Master downloads progress"><div id="master-downloads-progress-fill" class="progress-fill" style="width: {progress_percent}%"></div></div>
               <div class="sync-detail-grid">
                 <div id="progress-phase" class="sync-detail"><small>Phase</small><strong>{progress_phase}</strong></div>
-                <div id="progress-label" class="sync-detail"><small>Progress</small><strong>{progress_label}</strong></div>
+                <div id="progress-label" class="sync-detail"><small>Progress</small><strong>{escape(progress_label)}</strong></div>
                 <div id="progress-found" class="sync-detail"><small>Found</small><strong>{found}</strong></div>
               </div>
             </div>
@@ -924,11 +1005,16 @@ def media_metadata(path: Path) -> dict[str, str]:
 
 
 def logged_in_qobuz_client(state: SyncState | None) -> object | None:
+    global _QOBUZ_CLIENT_CACHE
     if state is None:
         return None
     config = state.load_config()
     if not config.is_configured:
         return None
+    now = time.monotonic()
+    cached = _QOBUZ_CLIENT_CACHE
+    if cached is not None and cached[0] > now - 60 and cached[1] is not None:
+        return cached[1]
     try:
         client = SyncService(state)._build_client()
         client.login(
@@ -937,9 +1023,11 @@ def logged_in_qobuz_client(state: SyncState | None) -> object | None:
             user_id=config.qobuz_user_id,
             user_auth_token=config.qobuz_user_auth_token,
         )
-        return client
     except Exception:
+        _QOBUZ_CLIENT_CACHE = (now, None)
         return None
+    _QOBUZ_CLIENT_CACHE = (now, client)
+    return client
 
 
 def qobuz_download_metadata(client: object | None, row: dict) -> dict[str, str]:
@@ -1043,6 +1131,23 @@ def recover_cover_from_qobuz(state: SyncState, kind: str, purchase_id: str, path
     return first_cover_for_path(path)
 
 
+def cached_recover_cover(state: SyncState, kind: str, purchase_id: str, path: Path) -> Path | None:
+    """Recover cover art at most once per id to avoid hammering Qobuz's API.
+
+    Every miss is short-circuited for an hour so accidental or brute-forced
+    ``/art/...`` requests cannot trigger repeated authenticated Qobuz logins.
+    """
+    key = f"{kind}:{purchase_id}"
+    now = time.monotonic()
+    with _ART_RECOVERY_LOCK:
+        if _ART_RECOVERY_CACHE.get(key) is not None and now - _ART_RECOVERY_CACHE[key] < _ART_RECOVERY_TTL_SECONDS:
+            return first_cover_for_path(path)
+    art = recover_cover_from_qobuz(state, kind, purchase_id, path)
+    with _ART_RECOVERY_LOCK:
+        _ART_RECOVERY_CACHE[key] = time.monotonic()
+    return art
+
+
 def download_title(state: SyncState, kind: str, purchase_id: str) -> str:
     for row in state.list_downloads(limit=200):
         if str(row.get("kind")) == kind and str(row.get("purchase_id")) == purchase_id:
@@ -1126,13 +1231,14 @@ def progress_payload(state: SyncState) -> dict[str, object]:
     latest = state.latest_sync()
     downloads = enrich_downloads(state.list_downloads(limit=20), state=state)
     track_progress = build_track_progress_rows(state)
+    strip_path = lambda rows: [{key: value for key, value in row.items() if key != "path"} for row in rows]
     return {
         "progress": progress,
         "latest_sync": latest,
         "downloaded_total": state.count_downloads(),
-        "downloads": downloads,
+        "downloads": strip_path(downloads),
         "downloads_html": render_download_rows(downloads, track_progress=track_progress),
-        "track_progress": track_progress,
+        "track_progress": strip_path(track_progress),
     }
 
 
@@ -1150,6 +1256,58 @@ def escape(value: object) -> str:
         .replace('"', "&quot;")
         .replace("'", "&#x27;")
     )
+
+
+def render_login(*, error: str = "") -> str:
+    error_html = f'<p class="login-error">{escape(error)}</p>' if error else ""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Qobuz Sync · Access</title>
+  <style>
+    :root {{ color-scheme: dark; --bg: #05060a; --text: #f8fafc; --muted: rgba(255,255,255,.66); --accent: #f59e0b; }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      background:
+        radial-gradient(circle at 16% 10%, rgba(245, 158, 11, .22), transparent 28rem),
+        radial-gradient(circle at 78% 8%, rgba(99, 102, 241, .22), transparent 28rem),
+        linear-gradient(145deg, #05060a 0%, #0c1020 48%, #05060a 100%);
+      color: var(--text);
+    }}
+    form {{
+      width: min(22rem, 92vw); padding: 1.6rem; border-radius: 24px;
+      background: rgba(255,255,255,.075); border: 1px solid rgba(255,255,255,.14);
+      box-shadow: 0 32px 100px rgba(0,0,0,.48); backdrop-filter: blur(28px) saturate(1.25);
+    }}
+    h1 {{ font-size: 1.35rem; letter-spacing: -.04em; margin: 0 0 .25rem; }}
+    p {{ color: var(--muted); margin: 0 0 1rem; line-height: 1.55; }}
+    .login-error {{ color: #fb7185; font-weight: 700; }}
+    input {{
+      width: 100%; padding: .85rem .95rem; margin: 0 0 .9rem; border-radius: 16px; color: #fff;
+      border: 1px solid rgba(255,255,255,.12); background: rgba(5, 7, 12, .54); outline: none;
+    }}
+    input:focus {{ border-color: rgba(245, 158, 11, .7); box-shadow: 0 0 0 4px rgba(245,158,11,.13); }}
+    button {{
+      width: 100%; border: 0; border-radius: 999px; padding: .85rem 1.15rem; font-weight: 850; cursor: pointer;
+      color: #111827; background: linear-gradient(135deg, var(--accent), #f97316);
+      box-shadow: 0 14px 32px rgba(245, 158, 11, .28);
+    }}
+  </style>
+</head>
+<body>
+  <form method="post" action="/login">
+    <h1>Qobuz Sync</h1>
+    <p>Enter the access token to open the dashboard. Set <code>QOBUZ_SYNC_AUTH_TOKEN</code> on the service to change it.</p>
+    {error_html}
+    <input name="token" type="password" autocomplete="current-password" placeholder="Access token" autofocus required>
+    <button type="submit">Unlock dashboard</button>
+  </form>
+</body>
+</html>
+"""
 
 
 app = create_app()

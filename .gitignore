@@ -7,3 +7,5 @@ __pycache__/
 /data/
 /downloads/
 .DS_Store
+.local/
+.local/

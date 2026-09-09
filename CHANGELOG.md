@@ -1,8 +1,17 @@
 # Changelog
 
-## 0.1.46
+## 0.1.47
 
-- Publishes the live-refresh dashboard changes under a fresh Umbrel-visible package version after 0.1.45 was partially prepared.
+- Fixes the `/sync-now` job lock so overlapping sync/re-sync jobs cannot run concurrently (previously the lock was released before the worker started).
+- Adds opt-in dashboard authentication via the `QOBUZ_SYNC_AUTH_TOKEN` environment variable (login page + HttpOnly SameSite cookie + Bearer/API-key support), with CSRF origin checks on all state-changing requests.
+- Redacts Qobuz credentials from API error messages before they reach the UI, database, or logs.
+- Stops committing third-party binaries: removes the `.local/` git/openssl/apk tree from the repository.
+- Caches cover-art recovery so `/art/...` requests stop triggering repeated authenticated Qobuz logins.
+- Reuses the logged-in Qobuz client for the live-refresh dashboard instead of logging in on every poll.
+- Strips local filesystem paths from the public JSON progress API.
+- Uses SQLite WAL + busy timeout to reduce `database is locked` errors under concurrent access.
+- Removes partially-written FLAC/cover files if an interrupted download fails.
+- Escapes the last unescaped status label and drops the unused `jinja2` dependency.
 
 ## 0.1.45
 

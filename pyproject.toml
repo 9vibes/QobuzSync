@@ -1,12 +1,11 @@
 [project]
 name = "qobuz-sync"
-version = "0.1.46"
+version = "0.1.47"
 description = "Self-hosted Qobuz purchased music downloader for Umbrel"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",
-  "jinja2>=3.1",
   "requests>=2.32",
   "python-multipart>=0.0.9",
   "mutagen>=1.47",

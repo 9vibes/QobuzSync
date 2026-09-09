@@ -12,6 +12,20 @@ from .state import AppConfig, DEFAULT_DOWNLOAD_DIR, SyncState
 
 LOGGER = logging.getLogger(__name__)
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._() \-\[\]]+")
+_SENSITIVE_PARAM_RE = re.compile(
+    r"(user_auth_token|user_id|password|app_id|app_secret|seed|request_sig)=([^&\"'\\s]+)",
+    re.IGNORECASE,
+)
+
+
+def _safe_message(exc: Exception) -> str:
+    """Stringify an exception with query-string credentials redacted.
+
+    ``requests`` errors embed the full request URL (which carries the Qobuz
+    ``user_auth_token``) in their message text; those messages flow into the UI,
+    the database, and the logs, so strip sensitive parameters before surfacing.
+    """
+    return _SENSITIVE_PARAM_RE.sub(r"\1=[REDACTED]", str(exc))
 
 
 class PurchaseClient(Protocol):
@@ -113,8 +127,8 @@ class SyncService:
             self.state.clear_track_progress()
         except Exception as exc:
             LOGGER.exception("Qobuz sync failed")
-            result = {"success": False, "found": 0, "downloaded": 0, "message": str(exc)}
-            self.state.set_progress(phase="error", message=str(exc), current=0, total=0)
+            result = {"success": False, "found": 0, "downloaded": 0, "message": _safe_message(exc)}
+            self.state.set_progress(phase="error", message=_safe_message(exc), current=0, total=0)
             self.state.clear_track_progress()
 
         self.state.record_sync(**result)  # type: ignore[arg-type]
