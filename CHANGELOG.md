@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.48
+
+- Removes the "running without an access token" security notice from the dashboard (the optional `QOBUZ_SYNC_AUTH_TOKEN` login still works if you set it).
+- Uses a randomized internal web port (23809) for the container instead of the default 8080.
+
 ## 0.1.47
 
 - Fixes the `/sync-now` job lock so overlapping sync/re-sync jobs cannot run concurrently (previously the lock was released before the worker started).

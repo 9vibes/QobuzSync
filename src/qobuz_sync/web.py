@@ -123,7 +123,6 @@ def create_app() -> FastAPI:
             total_downloads=total_downloads,
             progress=progress,
             track_progress=track_progress,
-            auth_configured=bool(auth_token()),
         )
 
     @app.get("/art/{kind}/{purchase_id}")
@@ -301,7 +300,6 @@ def render_home(
     total_downloads: int | None = None,
     progress: dict | None = None,
     track_progress: list[dict] | None = None,
-    auth_configured: bool = True,
 ) -> str:
     configured = "Configured" if config.is_configured else "Not configured"
     status_class = "ready" if config.is_configured else "needs-setup"
@@ -334,15 +332,6 @@ def render_home(
     password_note = "Saved password hash is stored; enter a new password to replace it." if config.qobuz_password_md5 else "Password is converted to a Qobuz-compatible hash before storage."
     token_note = "Saved token is stored; enter a new token to replace it." if config.qobuz_user_auth_token else "Use when Qobuz blocks password API login."
     localuser_note = "Paste the full localuser value from Qobuz Web Player to fill user ID and token automatically."
-    auth_notice = (
-        ""
-        if auth_configured
-        else (
-            '<div class="notice"><p><strong>Security notice:</strong> this dashboard is running without an access '
-            "token. Set the <code>QOBUZ_SYNC_AUTH_TOKEN</code> environment variable (or keep it behind Umbrel's "
-            "authenticated proxy) before exposing the app to your network.</p></div>"
-        )
-    )
     # Render a static HTML template with escaped dynamic values; this is not a SQL query.
     return f"""
 <!doctype html>
@@ -613,7 +602,6 @@ def render_home(
           <form id="sync-now-form" class="sync-form" method="post" action="/sync-now"><button id="sync-now-button" type="submit">Sync now</button><span id="sync-now-check" class="sync-check" aria-live="polite" aria-label="Sync started">✓</span></form>
           <form id="resync-all-form" class="sync-form" method="post" action="/resync-all"><button id="resync-all-button" class="danger-button" type="submit">Re Sync Entire Library</button><span id="resync-all-check" class="sync-check" aria-live="polite" aria-label="Entire library re-synced">✓</span></form>
         </div>
-        {auth_notice}
       </div>
     </div>
     <aside class="status-panel hero-card">

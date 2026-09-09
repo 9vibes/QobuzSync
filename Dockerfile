@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     QOBUZ_SYNC_DATA_DIR=/data \
     QOBUZ_SYNC_BACKGROUND=1 \
     WEB_HOST=0.0.0.0 \
-    WEB_PORT=8080
+    WEB_PORT=23809
 
 WORKDIR /app
 
@@ -20,6 +20,6 @@ RUN pip install --no-cache-dir . && \
     chown -R app:app /data /downloads /app
 
 VOLUME ["/data", "/downloads"]
-EXPOSE 8080
+EXPOSE 23809
 
 CMD ["python", "-m", "qobuz_sync"]
