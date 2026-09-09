@@ -204,9 +204,10 @@ def parse_qobuz_localuser(raw_value: str) -> tuple[str, str, str]:
         return "", "", ""
     if not isinstance(payload, dict):
         return "", "", ""
-    user_id = payload.get("id") or payload.get("user_id")
+    user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+    user_id = payload.get("id") or payload.get("user_id") or user.get("id")
     token = payload.get("token") or payload.get("user_auth_token")
-    email = payload.get("email") or payload.get("login")
+    email = payload.get("email") or payload.get("login") or user.get("email") or user.get("login")
     return str(user_id or "").strip(), str(token or "").strip(), str(email or "").strip()
 
 

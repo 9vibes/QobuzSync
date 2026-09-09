@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from qobuz_sync.web import create_app
+from qobuz_sync.web import create_app, parse_qobuz_localuser
 
 
 def test_status_page_loads_with_no_configuration(tmp_path, monkeypatch):
@@ -128,6 +128,21 @@ def test_settings_can_parse_pasted_qobuz_localuser_session(tmp_path, monkeypatch
     assert "uat-123" not in home.text
     assert "Saved token is stored; enter a new token to replace it." in home.text
     assert "Configured" in home.text
+
+
+def test_parse_qobuz_localuser_accepts_nested_user_session():
+    user_id, token, email = parse_qobuz_localuser(
+        '{"user_auth_token": "uat-123", "user": {"id": 123, "email": "me@example.com"}}'
+    )
+
+    assert user_id == "123"
+    assert token == "uat-123"
+    assert email == "me@example.com"
+
+
+def test_parse_qobuz_localuser_ignores_invalid_values():
+    assert parse_qobuz_localuser("not json") == ("", "", "")
+    assert parse_qobuz_localuser('["not", "an", "object"]') == ("", "", "")
 
 
 def test_downloaded_stat_shows_total_recorded_downloads_not_latest_delta(tmp_path, monkeypatch):
