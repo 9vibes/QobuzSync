@@ -131,6 +131,16 @@ def test_parse_qobuz_localuser_accepts_nested_user_session():
     assert email == "me@example.com"
 
 
+def test_parse_qobuz_localuser_accepts_storage_row_paste():
+    user_id, token, email = parse_qobuz_localuser(
+        'localuser\t{"id":3389759,"login":"me@example.com","email":"me@example.com","token":"redacted-token"}'
+    )
+
+    assert user_id == "3389759"
+    assert token == "redacted-token"
+    assert email == "me@example.com"
+
+
 def test_parse_qobuz_localuser_ignores_invalid_values():
     assert parse_qobuz_localuser("not json") == ("", "", "")
     assert parse_qobuz_localuser('["not", "an", "object"]') == ("", "", "")

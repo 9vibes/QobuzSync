@@ -122,6 +122,49 @@ def test_settings_require_normalized_same_origin(state, base_url, origin, accept
     assert state.load_config().quality == (27 if accepted else before.quality)
 
 
+def test_settings_accept_proxy_forwarded_same_origin(state):
+    client = TestClient(web.create_app(), base_url="http://qobuz-sync:23809")
+
+    response = client.post(
+        "/settings",
+        data={
+            "qobuz_localuser": '{"user_auth_token": "uat-123", "user": {"id": 123, "email": "me@example.com"}}',
+            "quality": "27",
+        },
+        headers={
+            "Origin": "https://umbrel.local",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "umbrel.local",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    config = state.load_config()
+    assert config.quality == 27
+    assert config.qobuz_user_id == "123"
+    assert config.qobuz_user_auth_token == "uat-123"
+
+
+def test_settings_reject_proxy_forwarded_cross_origin(state):
+    client = TestClient(web.create_app(), base_url="http://qobuz-sync:23809")
+    before = state.load_config()
+
+    response = client.post(
+        "/settings",
+        data={"quality": "27"},
+        headers={
+            "Origin": "https://evil.test",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "umbrel.local",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert state.load_config().quality == before.quality
+
+
 @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
 def test_cross_site_mutations_without_origin_are_rejected(state, method):
     client = TestClient(web.create_app())

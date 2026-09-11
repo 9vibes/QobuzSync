@@ -69,20 +69,7 @@ def create_app() -> FastAPI:
         if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
             origin = request.headers.get("origin", "")
             if origin:
-                try:
-                    parsed = urlparse(origin)
-                    default_port = lambda scheme: 443 if scheme == "https" else 80
-                    same_origin = (
-                        parsed.scheme in {"http", "https"}
-                        and parsed.scheme == request.url.scheme
-                        and parsed.hostname == request.url.hostname
-                        and (parsed.port or default_port(parsed.scheme)) == (request.url.port or default_port(request.url.scheme))
-                        and not parsed.username and not parsed.password
-                        and parsed.path in {"", "/"} and not parsed.query and not parsed.fragment
-                    )
-                except ValueError:
-                    same_origin = False
-                if not same_origin:
+                if not is_same_origin_request(request, origin):
                     return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
             elif request.headers.get("sec-fetch-site") == "cross-site":
                 return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
@@ -274,6 +261,58 @@ def create_app() -> FastAPI:
     return app
 
 
+def forwarded_value(request: Request, header: str) -> str:
+    return request.headers.get(header, "").split(",", 1)[0].strip()
+
+
+def default_port(scheme: str) -> int:
+    return 443 if scheme == "https" else 80
+
+
+def forwarded_port(request: Request) -> int | None:
+    value = forwarded_value(request, "x-forwarded-port")
+    if not value:
+        return None
+    try:
+        port = int(value)
+    except ValueError:
+        return None
+    return port if 0 < port <= 65535 else None
+
+
+def origin_parts(scheme: str, host: str, port: int | None = None) -> tuple[str, str, int] | None:
+    if scheme not in {"http", "https"} or not host:
+        return None
+    try:
+        parsed = urlparse(f"{scheme}://{host}")
+        if parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            return None
+        return parsed.scheme, parsed.hostname or "", parsed.port or port or default_port(parsed.scheme)
+    except ValueError:
+        return None
+
+
+def is_same_origin_request(request: Request, origin: str) -> bool:
+    try:
+        parsed = urlparse(origin)
+        if parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            return False
+        origin_normalized = origin_parts(parsed.scheme, parsed.netloc)
+    except ValueError:
+        return False
+    if not origin_normalized:
+        return False
+
+    candidates = {
+        origin_parts(request.url.scheme, request.url.hostname or "", request.url.port),
+    }
+    forwarded_proto = forwarded_value(request, "x-forwarded-proto")
+    forwarded_host = forwarded_value(request, "x-forwarded-host") or forwarded_value(request, "host")
+    if forwarded_proto and forwarded_host:
+        candidates.add(origin_parts(forwarded_proto, forwarded_host, forwarded_port(request)))
+    return origin_normalized in {candidate for candidate in candidates if candidate}
+
+
 def parse_qobuz_localuser(raw_value: str) -> tuple[str, str, str]:
     """Extract useful login values from Qobuz Web Player's localuser blob.
 
@@ -285,6 +324,10 @@ def parse_qobuz_localuser(raw_value: str) -> tuple[str, str, str]:
     value = str(raw_value or "").strip()
     if not value:
         return "", "", ""
+    if not value.startswith("{"):
+        _, separator, possible_json = value.partition("{")
+        if separator:
+            value = "{" + possible_json
     try:
         payload = json.loads(value)
     except json.JSONDecodeError:
