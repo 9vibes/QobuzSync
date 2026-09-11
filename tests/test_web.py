@@ -133,10 +133,10 @@ def test_parse_qobuz_localuser_accepts_nested_user_session():
 
 def test_parse_qobuz_localuser_accepts_storage_row_paste():
     user_id, token, email = parse_qobuz_localuser(
-        'localuser\t{"id":3389759,"login":"me@example.com","email":"me@example.com","token":"redacted-token"}'
+        'localuser\t{"id":1234567,"login":"me@example.com","email":"me@example.com","token":"redacted-token"}'
     )
 
-    assert user_id == "3389759"
+    assert user_id == "1234567"
     assert token == "redacted-token"
     assert email == "me@example.com"
 
