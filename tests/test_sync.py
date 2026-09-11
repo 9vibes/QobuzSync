@@ -12,6 +12,10 @@ class FakePurchaseClient:
         self.login_calls = []
         self.download_calls = []
         self.extra_calls = []
+        self.disk_checks = []
+        self.skip_existing_calls = []
+        self.registration_calls = []
+        self.known_paths = []
 
     def login(self, *, user_id: str = "", user_auth_token: str = ""):
         self.login_calls.append((user_id, user_auth_token))
@@ -22,8 +26,17 @@ class FakePurchaseClient:
             {"kind": "track", "id": "222", "title": "Song Two"},
         ]
 
-    def download_owned_item(self, item, download_dir, quality, *, include_extras=True, progress_callback=None, track_progress_callback=None):
+    def find_existing_purchase(self, item, download_dir, quality, *, known_path=None):
+        self.disk_checks.append((item, download_dir, quality, known_path))
+        return None
+
+    def register_existing_purchase(self, item, download_dir, path):
+        self.registration_calls.append((item, download_dir, path))
+
+    def download_owned_item(self, item, download_dir, quality, *, include_extras=True, skip_existing=False, known_path=None, progress_callback=None, track_progress_callback=None):
         self.download_calls.append((item, download_dir, quality, include_extras))
+        self.skip_existing_calls.append(skip_existing)
+        self.known_paths.append(known_path)
         output = self.output_dir / f"{item['kind']}-{item['id']}"
         if item["kind"] == "album":
             output.mkdir(exist_ok=True)
@@ -66,6 +79,162 @@ def test_sync_once_downloads_only_new_purchases(tmp_path: Path):
     progress = state.latest_progress()
     assert progress is not None
     assert progress["phase"] == "complete"
+
+
+@pytest.mark.parametrize("kind", ["track", "album"])
+@pytest.mark.parametrize("embed_art", [False, True])
+def test_sync_registers_existing_disk_purchase_without_counting_a_download(tmp_path, monkeypatch, kind, embed_art):
+    monkeypatch.setattr("qobuz_sync.state.DEFAULT_DOWNLOAD_DIR", str(tmp_path))
+    state = SyncState(tmp_path / "state.db")
+    state.save_config(AppConfig(qobuz_user_id="123", qobuz_user_auth_token="test-token", embed_art=embed_art))
+    folder = tmp_path / "existing"
+    folder.mkdir()
+    audio = folder / "song.flac"
+    audio.write_bytes(b"existing audio")
+    existing_path = folder if kind == "album" else audio
+    client = FakePurchaseClient(tmp_path)
+
+    def discover(item, download_dir, quality, *, known_path=None):
+        client.disk_checks.append((item, download_dir, quality, known_path))
+        return existing_path if item["kind"] == kind else None
+
+    monkeypatch.setattr(client, "find_existing_purchase", discover)
+    result = SyncService(state, client=client).sync_once()
+
+    assert result["success"] is True
+    assert result["downloaded"] == 1
+    assert "1 existing purchase(s) found on disk" in result["message"]
+    assert len(client.download_calls) == 1
+    assert client.download_calls[0][0]["kind"] != kind
+    assert client.skip_existing_calls == [True]
+    assert len(client.registration_calls) == 1
+    assert client.registration_calls[0][2] == existing_path
+    assert state.downloaded_path(kind, "111" if kind == "album" else "222") == str(existing_path)
+    assert state.count_downloads() == 2
+    assert len(client.extra_calls) == (1 if embed_art else 0)
+    assert audio.read_bytes() == b"existing audio"
+    assert state.plan_new_downloads(client.list_owned_items()) == []
+    assert SyncService(state, client=client).sync_once()["downloaded"] == 0
+    assert len(client.disk_checks) == 2
+
+
+def test_sync_passes_legacy_path_to_discovery_and_establishes_manifest(tmp_path, monkeypatch):
+    state = SyncState(tmp_path / "state.db")
+    state.save_config(AppConfig(qobuz_user_id="123", qobuz_user_auth_token="test-token", embed_art=False))
+    folder = tmp_path / "legacy"
+    state.mark_downloaded("album", "111", path=str(folder))
+    folder.mkdir()
+    (folder / "01.flac").write_bytes(b"existing audio")
+    client = FakePurchaseClient(tmp_path)
+    monkeypatch.setattr(client, "list_owned_items", lambda **kwargs: [{"kind": "album", "id": "111"}])
+
+    def discover(item, download_dir, quality, *, known_path=None):
+        assert known_path == str(folder)
+        return folder
+
+    monkeypatch.setattr(client, "find_existing_purchase", discover)
+    assert SyncService(state, client=client).sync_once()["downloaded"] == 0
+    assert not client.download_calls
+    assert state.plan_new_downloads(client.list_owned_items()) == []
+
+
+def test_dry_run_checks_disk_without_registering_existing_purchase(tmp_path, monkeypatch):
+    monkeypatch.setenv("QOBUZ_SYNC_DRY_RUN", "1")
+    state = SyncState(tmp_path / "state.db")
+    state.save_config(AppConfig(qobuz_user_id="123", qobuz_user_auth_token="test-token"))
+    client = FakePurchaseClient(tmp_path)
+    audio = tmp_path / "song.flac"
+    audio.write_bytes(b"existing audio")
+    monkeypatch.setattr(client, "find_existing_purchase", lambda item, *args, **kwargs: audio if item["kind"] == "track" else None)
+
+    result = SyncService(state, client=client).sync_once()
+
+    assert result["success"] is True
+    assert "1 purchases would be downloaded" in result["message"]
+    assert "1 existing purchase(s) found on disk" in result["message"]
+    assert state.count_downloads() == 0
+    assert not client.download_calls
+    assert not client.extra_calls
+    assert audio.read_bytes() == b"existing audio"
+    assert not client.registration_calls
+
+
+def test_force_resync_bypasses_disk_discovery_and_existing_file_reuse(tmp_path, monkeypatch):
+    state = SyncState(tmp_path / "state.db")
+    state.save_config(AppConfig(qobuz_user_id="123", qobuz_user_auth_token="test-token"))
+    client = FakePurchaseClient(tmp_path)
+    service = SyncService(state, client=client)
+    assert service.sync_once()["downloaded"] == 2
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Force resync must not adopt existing audio")
+
+    monkeypatch.setattr(client, "find_existing_purchase", forbidden)
+    assert service.resync_entire_library()["downloaded"] == 2
+    assert client.skip_existing_calls == [True, True, False, False]
+    assert client.known_paths[-2:] == [str(tmp_path / "album-111"), str(tmp_path / "track-222.flac")]
+
+
+def test_discovery_failure_is_redacted_and_does_not_block_other_purchases(tmp_path, monkeypatch, caplog):
+    state = SyncState(tmp_path / "state.db")
+    state.save_config(AppConfig(qobuz_user_id="123", qobuz_user_auth_token="test-token"))
+    client = FakePurchaseClient(tmp_path)
+
+    def discover(item, *args, **kwargs):
+        if item["kind"] == "album":
+            raise QobuzError("Metadata failed?user_auth_token=private-token")
+        return None
+
+    monkeypatch.setattr(client, "find_existing_purchase", discover)
+    result = SyncService(state, client=client).sync_once()
+    assert result["success"] is False
+    assert result["downloaded"] == 1
+    assert client.download_calls[0][0]["kind"] == "track"
+    assert "private-token" not in str(result) + caplog.text + str(state.latest_sync())
+
+
+def test_sync_discovers_real_flac_after_database_loss(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from qobuz_sync.qobuz_client import QobuzClient
+
+    monkeypatch.setattr("qobuz_sync.state.DEFAULT_DOWNLOAD_DIR", str(tmp_path))
+    state = SyncState(tmp_path / "state.db")
+    state.save_config(AppConfig(qobuz_user_id="123", qobuz_user_auth_token="test-token", embed_art=False))
+    folder = tmp_path / "Artist" / "Album"
+    folder.mkdir(parents=True)
+    audio = folder / "Song [track-one].flac"
+    # One second of constant-zero FLAC audio, including frame CRCs.
+    streaminfo = b"\x1f\x40\x1f\x40" + b"\x00" * 6
+    streaminfo += ((8000 << 44) | (15 << 36) | 8000).to_bytes(8, "big") + b"\x00" * 16
+    data = b"fLaC\x80\x00\x00\x22" + streaminfo + bytes.fromhex("fff87408001f3fbc00000079f8")
+    audio.write_bytes(data)
+    client = QobuzClient("test-app")
+    monkeypatch.setattr(client, "login", Mock())
+    monkeypatch.setattr(client, "list_owned_items", lambda **kwargs: [{"kind": "track", "id": "track-one", "title": "Song"}])
+    monkeypatch.setattr(client, "get_track", Mock(return_value={"id": "track-one", "title": "Song", "duration": 1, "album": {"id": "album-one", "title": "Album", "artist": {"name": "Artist"}}}))
+    download_owned_item = client.download_owned_item
+    forbidden = Mock(side_effect=AssertionError("Existing audio must not be downloaded or rewritten"))
+    monkeypatch.setattr(client, "download_owned_item", forbidden)
+    monkeypatch.setattr(client, "download_owned_item_extras", forbidden)
+
+    for _ in range(2):
+        result = SyncService(state, client=client).sync_once()
+        assert result["success"] is True
+        assert result["downloaded"] == 0
+    assert state.downloaded_path("track", "track-one") == str(audio)
+    assert state.count_downloads() == 1
+    assert audio.read_bytes() == data
+    client.get_track.assert_called_once_with("track-one")
+    forbidden.assert_not_called()
+    monkeypatch.setattr(client, "download_owned_item", download_owned_item)
+    download_audio = Mock(return_value=audio)
+    monkeypatch.setattr(client, "download_track_file", download_audio)
+    forced = SyncService(state, client=client).resync_entire_library()
+    assert forced["success"] is True
+    assert forced["downloaded"] == 1
+    assert state.downloaded_path("track", "track-one") == str(audio)
+    assert download_audio.call_args.args[:2] == ("track-one", audio)
+    assert not (folder / ".qobuz-album-id").exists()
 
 
 def test_sync_records_album_download_progress(tmp_path: Path):
@@ -202,7 +371,7 @@ def test_sync_redownloads_album_after_one_manifest_file_is_deleted(tmp_path: Pat
     assert client.download_calls[-1][0]["kind"] == "album"
 
 
-def test_legacy_album_redownloads_once_and_preserves_old_directory(tmp_path: Path, monkeypatch):
+def test_unmatched_legacy_album_redownloads_once_and_preserves_old_directory(tmp_path: Path, monkeypatch):
     state = SyncState(tmp_path / "state.db")
     state.save_config(AppConfig(qobuz_user_id="123", qobuz_user_auth_token="uat-123"))
     legacy_album = tmp_path / "Legacy Album"

@@ -30,7 +30,9 @@ def _safe_message(exc: Exception) -> str:
 class PurchaseClient(Protocol):
     def login(self, *, user_id: str = "", user_auth_token: str = ""): ...
     def list_owned_items(self, *, include_albums: bool = True, include_tracks: bool = True) -> list[dict[str, str]]: ...
-    def download_owned_item(self, item: dict[str, str], download_dir: str | Path, quality: int, *, include_extras: bool = True, progress_callback: Callable[[int, int, str], None] | None = None, track_progress_callback: Callable[[str, str, str, str, int, int, str], None] | None = None) -> Path: ...
+    def find_existing_purchase(self, item: dict[str, str], download_dir: str | Path, quality: int, *, known_path: str | Path | None = None) -> Path | None: ...
+    def register_existing_purchase(self, item: dict[str, str], download_dir: str | Path, path: str | Path) -> None: ...
+    def download_owned_item(self, item: dict[str, str], download_dir: str | Path, quality: int, *, include_extras: bool = True, skip_existing: bool = False, known_path: str | Path | None = None, progress_callback: Callable[[int, int, str], None] | None = None, track_progress_callback: Callable[[str, str, str, str, int, int, str], None] | None = None) -> Path: ...
     def download_owned_item_extras(self, item: dict[str, str], downloaded_path: str | Path) -> list[Path]: ...
 
 
@@ -48,7 +50,7 @@ class SyncService:
             self.state.record_sync(**result)  # type: ignore[arg-type]
             return result
 
-        found = downloaded = 0
+        found = downloaded = discovered = 0
         total_to_download = 0
         failures: list[str] = []
         dry_run = os.environ.get("QOBUZ_SYNC_DRY_RUN", "0") == "1"
@@ -66,7 +68,29 @@ class SyncService:
             planned_keys = {(item["kind"], str(item["id"])) for item in plan}
             if plan:
                 self.state.clear_track_progress()
-            self.state.set_progress(phase="plan", message=f"Found {len(purchases)} purchases; {len(plan)} new downloads", current=0, total=len(plan))
+            if not force_redownload:
+                missing = []
+                for index, item in enumerate(plan, start=1):
+                    self.state.set_progress(phase="scan", message=f"Checking existing files for {item.get('title', item['id'])}", current=index, total=len(plan))
+                    try:
+                        existing_path = client.find_existing_purchase(
+                            item, config.download_dir, config.quality,
+                            known_path=self.state.downloaded_path(item["kind"], str(item["id"])),
+                        )
+                        if existing_path is None:
+                            missing.append(item)
+                            continue
+                        if not dry_run:
+                            client.register_existing_purchase(item, config.download_dir, existing_path)
+                            self.state.mark_downloaded(item["kind"], str(item["id"]), title=item.get("title", ""), path=str(existing_path))
+                        discovered += 1
+                        planned_keys.discard((item["kind"], str(item["id"])))
+                    except Exception as exc:
+                        message = _safe_message(exc)
+                        failures.append(message)
+                        LOGGER.error("Qobuz purchase disk check failed: %s", message)
+                plan = missing
+            self.state.set_progress(phase="plan", message=f"Found {len(purchases)} purchases; {discovered} found on disk; {len(plan)} new downloads", current=0, total=len(plan))
             total_to_download = len(plan)
             for item_index, item in enumerate(plan, start=1):
                 if dry_run:
@@ -102,6 +126,8 @@ class SyncService:
                         config.download_dir,
                         config.quality,
                         include_extras=config.embed_art,
+                        skip_existing=not force_redownload,
+                        known_path=self.state.downloaded_path(item["kind"], str(item["id"])),
                         progress_callback=album_progress,
                         track_progress_callback=track_progress,
                     )
@@ -137,8 +163,10 @@ class SyncService:
                 message = f"Dry run: {total_to_download} purchases would be downloaded"
             elif failures:
                 message = f"{len(failures)} purchase(s) failed: {'; '.join(failures)}"
+            if discovered:
+                message += f"; {discovered} existing purchase(s) found on disk"
             result = {"success": not failures, "found": found, "downloaded": downloaded, "message": message}
-            self.state.set_progress(phase="error" if failures else "complete", message=message if failures or dry_run else "All Good!", current=total_to_download, total=total_to_download)
+            self.state.set_progress(phase="error" if failures else "complete", message=message if failures or dry_run or discovered else "All Good!", current=total_to_download, total=total_to_download)
             self.state.clear_track_progress()
         except Exception as exc:
             LOGGER.error("Qobuz sync failed: %s", _safe_message(exc))

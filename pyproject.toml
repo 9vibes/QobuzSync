@@ -1,6 +1,6 @@
 [project]
 name = "qobuz-sync"
-version = "0.1.55"
+version = "0.1.56"
 description = "Self-hosted Qobuz purchased music downloader for Umbrel"
 requires-python = ">=3.11"
 dependencies = [

@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import math
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -304,6 +306,169 @@ class QobuzClient:
         raise QobuzError(f"Qobuz did not return a file URL for track {track_id}")
 
 
+    def find_existing_purchase(
+        self,
+        item: dict[str, str],
+        download_dir: str | Path,
+        quality: int,
+        *,
+        known_path: str | Path | None = None,
+    ) -> Path | None:
+        """Read-only discovery in the QobuzSync layout or an explicit legacy path.
+
+        Return a track file or a complete album directory, never a partial purchase.
+        Relative known_path values are relative to download_dir, not the working directory.
+        Unmarked albums require the exact audio filename set across FLAC and MP3,
+        plus raw title/album/artist tags.
+        Mutagen stream information is checked, not a full decode or lossless tier.
+        Metadata API errors propagate; inaccessible or untrusted files do not match.
+        """
+        kind = item["kind"]
+        item_id = self._safe_id(item["id"])
+        extension = ".mp3" if quality == 5 else ".flac"
+        if kind == "track":
+            track = self.get_track(item_id)
+            album = track.get("album", {}) if isinstance(track.get("album"), dict) else {}
+            album_id = album.get("id")
+            artist = self._track_artist_name(track, album)
+            title = self._album_title_only(album) if album else "Singles"
+            filenames = [f"{safe_filename(self._track_title_only(track))} [{item_id}]{extension}"]
+            tracks = [track]
+        elif kind == "album":
+            album = self.get_album(item_id)
+            album_id = item_id
+            artist = self._album_artist_name(album)
+            title = self._album_title_only(album)
+            tracks = album["tracks"]["items"]
+            filenames = [f"{index:02d}. {safe_filename(self._track_title_only(track))}{extension}"
+                         for index, track in enumerate(tracks, start=1)]
+        else:
+            raise ValueError("item kind must be 'album' or 'track'")
+        album_id = self._safe_id(album_id) if album_id is not None else None
+        try:
+            root = Path(download_dir).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        directory = root / safe_filename(artist) / safe_filename(title)
+        directories = [directory]
+        if album_id is not None:
+            alternate = directory.with_name(f"{safe_filename(title)} [{album_id}]")
+            directories.append(alternate)
+            try:
+                if self._existing_album_marker(root, alternate) == album_id:
+                    directories.reverse()  # Match _album_directory's established alternate preference.
+            except (OSError, RuntimeError, ValueError):
+                pass
+        candidates = [path / filenames[0] if kind == "track" else path for path in directories]
+        if known_path is not None:
+            known = Path(known_path)
+            candidates.insert(0, known if known.is_absolute() else root / known)
+        for candidate in dict.fromkeys(candidates):
+            try:
+                self._contained_path(root, candidate)
+                folder = candidate.parent if kind == "track" else candidate
+                if not folder.is_dir():
+                    continue
+                marker = self._existing_album_marker(root, folder)
+                if marker is not None and marker != album_id:
+                    continue
+                marked = marker is not None
+                if kind == "track":
+                    identified = candidate.stem.endswith(f"[{item_id}]") or (marked and candidate.name == filenames[0])
+                    if self._valid_existing_audio(root, candidate, quality, track, album, require_metadata=not identified):
+                        return candidate
+                else:
+                    if not marked and {path.name for path in folder.iterdir() if path.suffix.lower() in {".flac", ".mp3"}} != set(filenames):
+                        continue
+                    if tracks and all(
+                        self._valid_existing_audio(root, folder / filename, quality, track, album, require_metadata=not marked)
+                        for filename, track in zip(filenames, tracks)
+                    ):
+                        return folder
+            except (OSError, RuntimeError, ValueError):
+                continue
+        return None
+
+    def register_existing_purchase(self, item: dict[str, str], download_dir: str | Path, path: str | Path) -> None:
+        """Mark a verified album for future repair; standalone tracks need no marker.
+
+        The caller must first validate path with find_existing_purchase and must not
+        register during a dry run. This only writes an exclusive ownership marker,
+        never creates directories or changes existing metadata/audio.
+        """
+        if item["kind"] == "track":
+            return
+        if item["kind"] != "album":
+            raise ValueError("item kind must be 'album' or 'track'")
+        album_id = self._safe_id(item["id"])
+        root = Path(download_dir).resolve()
+        directory = Path(path)
+        directory = self._contained_path(root, directory if directory.is_absolute() else root / directory)
+        if not directory.is_dir():
+            raise QobuzError(f"Cannot register missing album directory: {directory}")
+        marker = self._contained_path(root, directory / ".qobuz-album-id")
+        try:
+            with marker.open("x", encoding="ascii") as handle:
+                handle.write(album_id)
+        except FileExistsError:
+            if self._existing_album_marker(root, directory) != album_id:
+                raise QobuzError(f"Album directory is already owned by another album: {album_id}")
+
+    def _existing_album_marker(self, root: Path, directory: Path) -> str | None:
+        marker = self._contained_path(root, directory / ".qobuz-album-id")
+        try:
+            descriptor = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise QobuzError(f"Cannot read album ownership marker: {marker}") from exc
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise QobuzError(f"Album ownership marker is not a regular file: {marker}")
+        with os.fdopen(descriptor, encoding="ascii") as handle:
+            return self._safe_id(handle.read().strip())
+
+    def _valid_existing_audio(
+        self, root: Path, path: Path, quality: int, track: dict[str, Any], album: dict[str, Any],
+        *, require_metadata: bool = False,
+    ) -> bool:
+        import mutagen
+        from mutagen.flac import FLAC
+        from mutagen.mp3 import MP3
+
+        try:
+            self._contained_path(root, path)
+            if path.suffix != (".mp3" if quality == 5 else ".flac") or not path.is_file() or path.stat().st_size == 0:
+                return False
+            audio = mutagen.File(path, easy=True)
+            if not isinstance(audio, MP3 if quality == 5 else FLAC):
+                return False
+            info = audio.info
+            if not math.isfinite(info.length) or info.length <= 0 or info.sample_rate <= 0 or info.channels <= 0 or info.bitrate <= 0:
+                return False
+            if isinstance(audio, MP3) and (info.layer != 3 or info.sketchy):
+                return False
+            try:
+                duration = float(track.get("duration"))
+            except (TypeError, ValueError):
+                duration = 0
+            # Qobuz durations are rounded seconds; allow encoder padding and small discrepancies.
+            if math.isfinite(duration) and duration > 0 and abs(info.length - duration) > max(2.0, duration * 0.02):
+                return False
+            if require_metadata:
+                performer = track.get("performer", {})
+                album_artist = album.get("artist", {})
+                artist = (performer.get("name") if isinstance(performer, dict) else None) or (
+                    album_artist.get("name") if isinstance(album_artist, dict) else None
+                )
+                expected = {"title": track.get("title") or track.get("name"),
+                            "album": album.get("title") or album.get("name"), "artist": artist}
+                if any(not value or audio.get(key) != [str(value)] for key, value in expected.items()):
+                    return False
+            return True
+        except (OSError, RuntimeError, ValueError, mutagen.MutagenError):
+            return False
+
     def download_owned_item(
         self,
         item: dict[str, str],
@@ -311,6 +476,8 @@ class QobuzClient:
         quality: int,
         *,
         include_extras: bool = True,
+        skip_existing: bool = False,
+        known_path: str | Path | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         track_progress_callback: Callable[[str, str, str, str, int, int, str], None] | None = None,
     ) -> Path:
@@ -319,18 +486,51 @@ class QobuzClient:
         This is intentionally conservative: it only downloads items that came from the
         authenticated user's purchase list. Album downloads iterate the album's track
         metadata and download each track into one album folder.
+        With skip_existing, valid destination audio is reused in the selected owned
+        folder; extras, tagging, and terminal downloaded callbacks still run.
+        known_path selects a matching marked album directory or an identified track
+        file without claiming its folder. Relative paths are beneath download_dir.
         """
         kind = item["kind"]
         item_id = self._safe_id(item["id"])
         root = Path(download_dir).resolve()
         extension = ".mp3" if quality == 5 else ".flac"
+        known_directory = None
+        if known_path is not None:
+            known = Path(known_path)
+            known = self._contained_path(root, known if known.is_absolute() else root / known)
+            known_directory = known.parent if kind == "track" else known
         if kind == "track":
             track = self.get_track(item_id)
             album = track.get("album", {}) if isinstance(track.get("album"), dict) else {}
             title = self._track_title_only(track)
+            album_id = self._safe_id(album["id"]) if album.get("id") is not None else None
             artist_dir = self._contained_path(root, root / safe_filename(self._track_artist_name(track, album)))
-            album_dir = self._album_directory(root, artist_dir, self._album_title_only(album) if album else "Singles", album.get("id"))
-            destination = self._contained_path(root, album_dir / f"{safe_filename(title)} [{item_id}]{extension}")
+            destination = None
+            if known_path is not None and known.suffix in {".flac", ".mp3"}:
+                try:
+                    marker = self._existing_album_marker(root, known.parent)
+                    candidate = self._contained_path(root, known.with_suffix(extension))
+                    identified = known.stem.endswith(f"[{item_id}]")
+                    if (marker is None or marker == album_id) and (not known.exists() or known.is_file()):
+                        source_matches = identified or self._valid_existing_audio(
+                            root, known, 5 if known.suffix == ".mp3" else 6, track, album, require_metadata=True,
+                        )
+                        # A quality change must not overwrite an unrelated same-stem file.
+                        target_matches = identified or candidate == known or not candidate.exists() or self._valid_existing_audio(
+                            root, candidate, quality, track, album, require_metadata=True,
+                        )
+                        if source_matches and target_matches and (not candidate.exists() or candidate.is_file()):
+                            destination = candidate
+                except (OSError, RuntimeError, ValueError):
+                    pass
+            if destination is None:
+                album_dir = self._album_directory(root, artist_dir, self._album_title_only(album) if album else "Singles", album_id,
+                                                  known_directory=known_directory)
+                destination = self._contained_path(root, album_dir / f"{safe_filename(title)} [{item_id}]{extension}")
+                marker = self._existing_album_marker(root, album_dir)
+                if marker is not None and marker != album_id:
+                    raise QobuzError(f"Album directory is already owned by another album: {album_id}")
             if progress_callback:
                 progress_callback(1, 1, title)
             if track_progress_callback:
@@ -340,7 +540,9 @@ class QobuzClient:
                 track_byte_progress = lambda downloaded, total: track_progress_callback(
                     kind, item_id, title, str(destination), downloaded, total, "downloading"
                 )
-            if track_byte_progress:
+            if skip_existing and self._valid_existing_audio(root, destination, quality, track, album):
+                path = destination
+            elif track_byte_progress:
                 path = self.download_track_file(item_id, destination, quality, progress_callback=track_byte_progress)
             else:
                 path = self.download_track_file(item_id, destination, quality)
@@ -356,7 +558,7 @@ class QobuzClient:
             album = self.get_album(item_id)
             album_title = self._album_title_only(album)
             artist_dir = self._contained_path(root, root / safe_filename(self._album_artist_name(album)))
-            album_dir = self._album_directory(root, artist_dir, album_title, item_id)
+            album_dir = self._album_directory(root, artist_dir, album_title, item_id, known_directory=known_directory)
             tracks_block = album.get("tracks", {}) if isinstance(album.get("tracks"), dict) else {}
             tracks = tracks_block.get("items", []) if isinstance(tracks_block, dict) else []
             if not tracks:
@@ -381,7 +583,9 @@ class QobuzClient:
                     track_byte_progress = lambda downloaded, total, track_id=track_id, title=title, destination=destination: track_progress_callback(
                         "track", track_id, title, str(destination), downloaded, total, "downloading"
                     )
-                if track_byte_progress:
+                if skip_existing and self._valid_existing_audio(root, destination, quality, track, album):
+                    last_path = destination
+                elif track_byte_progress:
                     last_path = self.download_track_file(track_id, destination, quality, progress_callback=track_byte_progress)
                 else:
                     last_path = self.download_track_file(track_id, destination, quality)
@@ -717,17 +921,27 @@ class QobuzClient:
             raise QobuzError(f"Download path escapes output directory: {path}")
         return path
 
-    def _album_directory(self, root: Path, artist_dir: Path, title: str, album_id: Any) -> Path:
-        directory = self._contained_path(root, artist_dir / safe_filename(title))
+    def _album_directory(
+        self, root: Path, artist_dir: Path, title: str, album_id: Any,
+        *, known_directory: str | Path | None = None,
+    ) -> Path:
         if album_id is None:
-            return directory
+            return self._contained_path(root, artist_dir / safe_filename(title))
         album_id = self._safe_id(album_id)
+        known = None
+        if known_directory is not None:
+            known = Path(known_directory)
+            known = self._contained_path(root, known if known.is_absolute() else root / known).resolve()
+            if known.is_dir() and self._existing_album_marker(root, known) == album_id:
+                return known
+        directory = self._contained_path(root, artist_dir / safe_filename(title))
         # Reuse known archives, but never claim nonempty folders with unknown ownership.
         alternate = self._contained_path(root, artist_dir / f"{safe_filename(title)} [{album_id}]")
-        alternate_marker = self._contained_path(root, alternate / ".qobuz-album-id")
-        if alternate_marker.is_file() and alternate_marker.read_text(encoding="ascii").strip() == album_id:
+        if alternate.resolve() != known and self._existing_album_marker(root, alternate) == album_id:
             return alternate
         for candidate in (directory, alternate):
+            if candidate.resolve() == known and candidate.exists():
+                continue  # A supplied unmarked/mismatched directory is never ours to claim.
             self._contained_path(root, candidate)
             marker = self._contained_path(root, candidate / ".qobuz-album-id")
             candidate.mkdir(parents=True, exist_ok=True)
@@ -738,7 +952,7 @@ class QobuzClient:
                     handle.write(album_id)
                 return candidate
             except FileExistsError:
-                if marker.read_text(encoding="ascii").strip() == album_id:
+                if self._existing_album_marker(root, candidate) == album_id:
                     return candidate
         raise QobuzError(f"Album directory is already owned by another album: {album_id}")
 

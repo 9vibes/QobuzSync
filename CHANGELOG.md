@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.56
+
+- Checks disk during normal sync before downloading unrecorded or incomplete purchases, registers complete matches, and reuses valid tracks in partially downloaded app-owned albums.
+- Uses conservative filename, album-ownership, audio-format, and duration checks; preserves uncertain folders and keeps full-library resync as an explicit forced download.
+- Retains Library cards through purchase completion and updates cards in place to preserve artwork nodes and scroll position.
+- Keeps large albums visible during downloads and refreshes artwork when local cover files change.
+- Adds disk-discovery, archive-repair, completion-handoff, and real-browser regression coverage.
+
 ## 0.1.55
 
 - Accepts Safari form submissions with `Origin: null` when a signed, browser-bound CSRF token is valid, while retaining authentication and cross-site request protection.

@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+import pytest
 
 from qobuz_sync.web import create_app, parse_qobuz_localuser
 
@@ -205,7 +206,7 @@ def test_recent_downloads_render_artwork_metadata_and_no_path_column(tmp_path, m
     home = client.get("/")
 
     assert 'class="download-card"' in home.text
-    assert 'class="album-art" src="/art/track/99"' in home.text
+    assert 'class="album-art" src="/art/track/99?v=' in home.text
     assert "Glass Song" in home.text
     assert "Umbrel Artist" in home.text
     assert "Dark Album" in home.text
@@ -379,6 +380,101 @@ def test_active_track_progress_without_download_record_renders_as_track_card(tmp
     assert "Writing to disk" in library_panel
     assert 'src="/progress-art/999"' in library_panel
     assert 'style="width: 50%"' in library_panel
+
+
+@pytest.mark.parametrize("kind", ["track", "album"])
+@pytest.mark.parametrize("resync", [False, True])
+def test_track_card_remains_until_completed_purchase_is_recorded(tmp_path, monkeypatch, kind, resync):
+    from qobuz_sync.state import SyncState
+
+    monkeypatch.setenv("QOBUZ_SYNC_DATA_DIR", str(tmp_path))
+    client = TestClient(create_app())
+    state = SyncState(tmp_path / "qobuz-sync.db")
+    state.set_progress(phase="download", message="Downloading")
+    path = "/downloads/example/01.flac"
+    if resync:
+        state.mark_downloaded(kind, "123" if kind == "track" else "album-1", title="Current Song" if kind == "track" else "Example Album", path=path if kind == "track" else "/downloads/example")
+    state.set_track_progress("track", "123", title="Current Song", path=path, downloaded_bytes=50, total_bytes=100)
+    assert "Current Song" in client.get("/api/progress").json()["downloads_html"]
+
+    state.set_track_progress("track", "123", title="Current Song", path=path, downloaded_bytes=100, total_bytes=100, status="downloaded")
+    if kind == "album":
+        state.set_track_progress("track", "456", title="Next Song", path="/downloads/example/02.flac", downloaded_bytes=10, total_bytes=100)
+    html = client.get("/api/progress").json()["downloads_html"]
+    assert html.count("<h3>Current Song</h3>") == 1
+    assert "Finishing purchase" in html
+    assert "Current Song" in client.get("/").text
+    if kind == "album":
+        assert "Next Song" in html
+
+    state.mark_downloaded(kind, "123" if kind == "track" else "album-1", title="Current Song" if kind == "track" else "Example Album", path=path if kind == "track" else "/downloads/example")
+    html = client.get("/api/progress").json()["downloads_html"]
+    assert html.count("<h3>Current Song</h3>") == (1 if kind == "track" else 0)
+    assert "Finishing purchase" not in html
+    if kind == "album":
+        assert "Example Album" in html
+        assert "Next Song" in html
+
+
+def test_progress_poll_does_not_lose_track_during_completion_handoff(tmp_path, monkeypatch):
+    from qobuz_sync.state import SyncState
+    from qobuz_sync.web import progress_payload
+
+    state = SyncState(tmp_path / "qobuz-sync.db")
+    state.set_progress(phase="download", message="Downloading")
+    state.set_track_progress("track", "123", title="Current Song", path="/downloads/song.flac", status="downloaded")
+    list_downloads = state.list_downloads
+
+    def finish_after_downloads_read(limit=20):
+        rows = list_downloads(limit=limit)
+        state.mark_downloaded("track", "123", title="Current Song", path="/downloads/song.flac")
+        state.clear_track_progress()
+        return rows
+
+    monkeypatch.setattr(state, "list_downloads", finish_after_downloads_read)
+    assert "Current Song" in progress_payload(state)["downloads_html"]
+    assert "Current Song" in progress_payload(state)["downloads_html"]
+
+
+def test_large_album_keeps_uncommitted_tracks_in_library(tmp_path):
+    from qobuz_sync.state import SyncState
+    from qobuz_sync.web import progress_payload
+
+    state = SyncState(tmp_path / "qobuz-sync.db")
+    state.set_progress(phase="album", message="Downloading a large album")
+    for index in range(55):
+        state.set_track_progress("track", str(index), title=f"Song {index}", path=f"/downloads/box-set/{index}.flac", status="downloaded" if index < 54 else "downloading")
+    payload = progress_payload(state)
+    assert len(payload["track_progress"]) == 55
+    assert payload["downloads_html"].count('class="download-card"') == 55
+    assert "<h3>Song 0</h3>" in payload["downloads_html"]
+    assert "<h3>Song 54</h3>" in payload["downloads_html"]
+    state.mark_downloaded("album", "box", title="Box Set", path="/downloads/box-set")
+    payload = progress_payload(state)
+    assert len(payload["track_progress"]) == 1
+    assert "Box Set" in payload["downloads_html"]
+
+
+def test_artwork_url_refreshes_only_when_local_art_changes(tmp_path):
+    from qobuz_sync.web import enrich_download, progress_only_download_row
+
+    path = str(tmp_path / "song.flac")
+    row = {"kind": "track", "purchase_id": "123", "title": "Song", "path": path}
+    progress = {**row, "status": "downloading", "downloaded_bytes": 10}
+    before = enrich_download(row)["art_url"]
+    progress_before = progress_only_download_row(("track", "123"), progress)["art_url"]
+    cover = tmp_path / "cover.jpg"
+    cover.write_bytes(b"cover-art")
+    after = enrich_download(row)["art_url"]
+    progress_after = progress_only_download_row(("track", "123"), progress)["art_url"]
+    assert after != before
+    assert progress_after != progress_before
+    progress["downloaded_bytes"] = 50
+    assert enrich_download(row)["art_url"] == after
+    assert progress_only_download_row(("track", "123"), progress)["art_url"] == progress_after
+    cover.write_bytes(b"replacement-cover-art")
+    assert enrich_download(row)["art_url"] != after
+    assert str(tmp_path) not in after
 
 
 def test_progress_only_cards_render_before_older_recent_downloads_with_art_route(tmp_path, monkeypatch):

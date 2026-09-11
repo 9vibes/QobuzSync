@@ -41,8 +41,10 @@ Manual fallback: open Storage / Local Storage, find `localuser`, then copy `toke
 
 ## Archive safety
 
-- Normal sync skips completed downloads and detects missing files using an album file manifest.
-- Albums saved by older releases receive one verification redownload to establish that manifest. Unmarked, nonempty legacy folders are preserved; replacements may use an album-ID suffix to avoid overwriting another edition.
+- **Sync now** checks disk before downloading unrecorded or incomplete purchases. Complete matching purchases are registered without downloading their audio again, and valid tracks in partially downloaded app-owned albums are reused. Scheduled sync uses the same checks.
+- Discovery checks QobuzSync's artist/album layout, album-ID-suffixed folders, and previously recorded paths. It does not fuzzy-match arbitrary renamed files. Unmarked legacy albums need a complete filename set and matching embedded title, album, and artist tags; uncertain folders remain untouched.
+- Registering a verified album adds an album-ID marker so future repairs reuse its folder. The disk check itself is read-only, and dry runs never register purchases or write markers. Unmarked folders containing extra audio in another format are not adopted.
+- Existing audio must match the requested MP3/FLAC format and have readable stream information and a compatible duration when Qobuz provides one. This is not a full decode/checksum check and does not distinguish FLAC quality tiers. Complete albums get a file manifest so later syncs detect deleted files.
 - **Re Sync Entire Library** redownloads the selected purchases without first deleting the library. Each file is replaced only after its transfer succeeds and its basic audio signature is checked. This is not a full audio integrity/decode check.
 - Dry runs only discover purchases; they never create completed-download records or replace audio.
 - Artwork and metadata repair runs during sync, not while viewing the dashboard. Missing local artwork gets a placeholder until the next repair.

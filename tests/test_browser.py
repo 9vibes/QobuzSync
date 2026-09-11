@@ -41,6 +41,7 @@ def dashboard(browser):
     html = render_home(AppConfig(), None, downloads)
     api = SimpleNamespace(
         calls=0, status=200, hold=False, pending=[], posts=[], unexpected=[],
+        downloads=downloads, art_calls=[],
         payload={
             "busy": False, "downloaded_total": 1,
             "latest_sync": {"success": True, "finished_at": "2026-09-11 12:00:00",
@@ -68,7 +69,8 @@ def dashboard(browser):
                 route.fulfill(status=api.status, json=api.payload)
         elif path in {"/sync-now", "/resync-all"} and route.request.method == "POST":
             api.posts.append(route)
-        elif path == "/art/track/123":
+        elif path in {"/art/track/123", "/art/track/active", "/progress-art/active"}:
+            api.art_calls.append(path)
             route.fulfill(content_type="image/svg+xml", body=(
                 '<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80"/>'
             ))
@@ -138,6 +140,79 @@ def test_initial_refresh_success_and_unchanged_library(dashboard):
         poll(page, api)
         assert page.evaluate("window.originalCard === document.querySelector('.download-card')")
     expect(page.locator("#downloaded-stat strong")).to_have_text("1")
+
+
+def test_downloading_cards_and_artwork_survive_progress_refreshes(dashboard):
+    page, api = dashboard
+    progress = {
+        "kind": "track", "purchase_id": "active", "title": "Active Song",
+        "status": "downloading", "downloaded_bytes": 10, "total_bytes": 100, "percent": 10,
+    }
+    api.payload["busy"] = True
+    api.payload["downloads_html"] = render_download_rows(api.downloads, track_progress=[progress])
+    poll(page, api)
+    card = page.locator('[data-download-key="track:active"]')
+    expect(card).to_be_visible()
+    expect(card.locator("img")).to_have_js_property("complete", True)
+    page.evaluate("""() => {
+        window.activeCard = document.querySelector('[data-download-key="track:active"]');
+        window.activeImage = window.activeCard.querySelector('img');
+    }""")
+    for percent in (30, 60, 100):
+        progress.update(downloaded_bytes=percent, percent=percent)
+        api.payload["downloads_html"] = render_download_rows(api.downloads, track_progress=[progress])
+        poll(page, api, 2000)
+        expect(card.get_by_role("progressbar")).to_have_attribute("aria-valuenow", str(percent))
+        assert page.evaluate("window.activeCard === document.querySelector('[data-download-key=\"track:active\"]')")
+        assert page.evaluate("window.activeImage === window.activeCard.querySelector('img')")
+        assert page.evaluate("window.originalCard === document.querySelector('[data-download-key=\"track:123\"]')")
+    assert api.art_calls.count("/progress-art/active") == 1
+
+    progress["status"] = "downloaded"
+    api.payload["downloads_html"] = render_download_rows(api.downloads, track_progress=[progress])
+    poll(page, api, 2000)
+    expect(card).to_contain_text("Finishing purchase")
+    expect(card.get_by_role("progressbar")).to_have_count(0)
+    assert page.evaluate("window.activeCard === document.querySelector('[data-download-key=\"track:active\"]')")
+
+    completed = {**api.downloads[0], "purchase_id": "active", "display_title": "Active Song", "art_url": "/art/track/active"}
+    api.payload["downloads_html"] = render_download_rows([completed, *api.downloads])
+    poll(page, api, 2000)
+    expect(card).to_have_count(1)
+    expect(card).not_to_contain_text("Finishing purchase")
+    assert page.evaluate("window.activeCard === document.querySelector('[data-download-key=\"track:active\"]')")
+    assert page.evaluate("window.activeImage === window.activeCard.querySelector('img')")
+
+
+def test_progress_refresh_preserves_library_scroll_position(dashboard):
+    page, api = dashboard
+    downloads = [{**api.downloads[0], "purchase_id": str(index)} for index in range(20)]
+    progress = {"kind": "track", "purchase_id": "active", "title": "Active Song", "status": "downloading", "percent": 10}
+    api.payload["busy"] = True
+    api.payload["downloads_html"] = render_download_rows(downloads, track_progress=[progress])
+    poll(page, api)
+    page.evaluate("document.getElementById('downloads-grid').scrollTop = 200")
+    before = page.locator("#downloads-grid").evaluate("grid => grid.scrollTop")
+    assert before > 0
+    progress["percent"] = 40
+    api.payload["downloads_html"] = render_download_rows(downloads, track_progress=[progress])
+    poll(page, api, 2000)
+    assert page.locator("#downloads-grid").evaluate("grid => grid.scrollTop") == before
+
+
+def test_artwork_version_change_updates_existing_image_node(dashboard):
+    page, api = dashboard
+    page.evaluate("window.originalImage = window.originalCard.querySelector('img')")
+    completed = {**api.downloads[0], "art_url": "/art/track/123?v=new-cover"}
+    api.payload["downloads_html"] = render_download_rows([completed])
+    with page.expect_request("**/art/track/123?v=new-cover"):
+        poll(page, api)
+    expect(page.locator(".album-art")).to_have_attribute("src", completed["art_url"])
+    assert page.evaluate("window.originalImage === document.querySelector('.album-art')")
+    assert page.evaluate("window.originalCard === document.querySelector('.download-card')")
+    count = len(api.art_calls)
+    poll(page, api)
+    assert len(api.art_calls) == count
 
 
 def test_slow_progress_has_at_most_one_request_in_flight(dashboard):

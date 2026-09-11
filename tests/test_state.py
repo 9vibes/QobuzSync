@@ -143,6 +143,70 @@ def test_track_progress_round_trips_and_clears(tmp_path: Path):
     assert state.list_track_progress() == []
 
 
+@pytest.mark.parametrize("status", ["downloaded", "downloading", "pending"])
+def test_mark_downloaded_retires_only_finished_matching_track(tmp_path: Path, status):
+    state = SyncState(tmp_path / "state.db")
+    state.set_track_progress("track", "123", path="/downloads/old.flac", status=status)
+    state.set_track_progress("album", "123", status="downloaded")
+    state.set_track_progress("track", "456", path="/downloads/song.flac", status="downloaded")
+
+    state.mark_downloaded("track", "123", path="/downloads/song.flac")
+
+    expected = {("album", "123"), ("track", "456")}
+    if status != "downloaded":
+        expected.add(("track", "123"))
+    assert {(row["kind"], row["purchase_id"]) for row in state.list_track_progress()} == expected
+    assert state.is_downloaded("track", "123")
+    assert state.count_downloads() == 1
+
+
+def test_mark_downloaded_retires_only_finished_direct_album_children(tmp_path: Path):
+    state = SyncState(tmp_path / "state.db")
+    album = tmp_path / "Album_100%"
+    progress = [
+        ("finished-1", album / "01.flac", "downloaded"),
+        ("finished-2", album / "02.flac", "downloaded"),
+        ("active", album / "03.flac", "downloading"),
+        ("pending", album / "04.flac", "pending"),
+        ("prefix", tmp_path / "Album_100% Deluxe" / "01.flac", "downloaded"),
+        ("wildcards", tmp_path / "AlbumX100more" / "01.flac", "downloaded"),
+        ("nested", album / "Disc 2" / "01.flac", "downloaded"),
+        ("unrelated", tmp_path / "Other" / "01.flac", "downloaded"),
+        ("no-path", "", "downloaded"),
+    ]
+    for purchase_id, path, status in progress:
+        state.set_track_progress("track", purchase_id, path=str(path), status=status)
+    before = state.list_track_progress()
+
+    state.mark_downloaded("album", "123", path=str(album))
+
+    assert state.list_track_progress() == [
+        row for row in before if row["purchase_id"] not in {"finished-1", "finished-2"}
+    ]
+    assert state.is_downloaded("album", "123")
+    assert state.count_downloads() == 1
+
+
+@pytest.mark.parametrize("kind", ["track", "album"])
+def test_progress_retirement_and_download_record_share_transaction(tmp_path: Path, kind):
+    state = SyncState(tmp_path / "state.db")
+    state.set_track_progress("track", "123", path="/downloads/album/song.flac", status="downloaded")
+    with state._connect() as con:
+        con.execute("""
+            create trigger reject_progress_retirement after delete on track_progress
+            begin
+                select raise(abort, 'retirement failed');
+            end
+        """)
+
+    path = "/downloads/album/song.flac" if kind == "track" else "/downloads/album"
+    with pytest.raises(sqlite3.IntegrityError, match="retirement failed"):
+        state.mark_downloaded(kind, "123", path=path)
+
+    assert state.count_downloads() == 0
+    assert [row["purchase_id"] for row in state.list_track_progress()] == ["123"]
+
+
 @pytest.mark.parametrize("missing", ["one", "all", "empty"])
 def test_album_manifest_detects_missing_audio_but_ignores_extras(tmp_path: Path, missing):
     state = SyncState(tmp_path / "state.db")

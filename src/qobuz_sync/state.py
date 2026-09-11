@@ -103,6 +103,19 @@ class SyncState:
                 "insert into download_files(kind, purchase_id, relative_path) values(?, ?, ?)",
                 [(kind, purchase_id, file) for file in audio_files],
             )
+            if kind == "track":
+                con.execute(
+                    "delete from track_progress where kind=? and purchase_id=? and status='downloaded'",
+                    (kind, purchase_id),
+                )
+            elif kind == "album" and path:
+                rows = con.execute(
+                    "select purchase_id, path from track_progress where kind='track' and status='downloaded'"
+                ).fetchall()
+                con.executemany(
+                    "delete from track_progress where kind='track' and purchase_id=? and status='downloaded'",
+                    [(row["purchase_id"],) for row in rows if row["path"] and Path(row["path"]).parent == album_dir],
+                )
 
     def is_downloaded(self, kind: str, purchase_id: str) -> bool:
         with self._connect() as con:
@@ -151,7 +164,7 @@ class SyncState:
                 elif root.is_file():
                     present = root.stat().st_size > 0
                 else:
-                    # Legacy directories need one successful redownload to establish a manifest.
+                    # Legacy directories need a metadata-backed disk check or download to establish a manifest.
                     present = False
             except OSError:
                 present = False
@@ -191,14 +204,14 @@ class SyncState:
                 (kind, purchase_id, title, path, max(0, int(downloaded_bytes)), max(0, int(total_bytes)), status),
             )
 
-    def list_track_progress(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_track_progress(self, limit: int | None = 50) -> list[dict[str, Any]]:
         with self._connect() as con:
             rows = con.execute(
                 """
                 select kind, purchase_id, title, path, downloaded_bytes, total_bytes, status
                 from track_progress order by updated_at desc, rowid desc limit ?
                 """,
-                (limit,),
+                (limit if limit is not None else -1,),
             ).fetchall()
         return [dict(row) for row in rows]
 

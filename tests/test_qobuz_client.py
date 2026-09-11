@@ -904,3 +904,657 @@ def test_failed_metadata_backfill_preserves_original_and_does_not_log_secrets(tm
     assert "Could not embed metadata" in caplog.text
     assert "secret-token" not in caplog.text
     assert "secret-signature" not in caplog.text
+
+
+def _write_existing_audio(path, quality=6, **tags):
+    """Small silent streams parsed by real Mutagen, without external encoders."""
+    from mutagen.flac import FLAC
+    from mutagen.mp3 import EasyMP3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if quality == 5:
+        # Forty MPEG-1 layer III mono frames, 128 kbps at 44.1 kHz (about one second).
+        path.write_bytes((b"\xff\xfb\x90\xc0" + b"\x00" * 413) * 40)
+        audio = EasyMP3(path)
+    else:
+        # One second at 8 kHz, mono/16-bit, with a constant-zero FLAC frame and CRCs.
+        streaminfo = b"\x1f\x40\x1f\x40" + b"\x00" * 6
+        streaminfo += ((8000 << 44) | (15 << 36) | 8000).to_bytes(8, "big") + b"\x00" * 16
+        path.write_bytes(b"fLaC\x80\x00\x00\x22" + streaminfo + bytes.fromhex("fff87408001f3fbc00000079f8"))
+        audio = FLAC(path)
+    if tags:
+        for key, value in tags.items():
+            audio[key] = value
+        audio.save()
+    return path
+
+
+@pytest.fixture
+def discovery_album():
+    return {
+        "id": "album-test", "title": "Album: One", "artist": {"name": "Artist"},
+        "tracks": {"items": [
+            {"id": "track-one", "title": "Song: One", "duration": 1},
+            {"id": "track-two", "title": "Song Two", "duration": 1, "media_number": 2},
+        ], "total": 2},
+    }
+
+
+def _discovery_client(album, kind):
+    session = FakeSession()
+    session.queue(album if kind == "album" else {**album["tracks"]["items"][0], "album": album})
+    return QobuzClient("app-test", session=session)
+
+
+@pytest.mark.parametrize("kind", ["track", "album"])
+@pytest.mark.parametrize("quality", [5, 6, 7, 27])
+@pytest.mark.parametrize("marked", [False, True])
+def test_find_existing_purchase_is_read_only(tmp_path, monkeypatch, discovery_album, kind, quality, marked):
+    album = discovery_album
+    extension = ".mp3" if quality == 5 else ".flac"
+    folder = tmp_path / "Artist" / "Album_ One"
+    for index, track in enumerate(album["tracks"]["items"], start=1):
+        name = f"{safe_filename(track['title'])} [{track['id']}]" if kind == "track" else f"{index:02d}. {safe_filename(track['title'])}"
+        # Marked archives and standalone ID filenames need no tags.
+        tags = {"title": track["title"], "album": album["title"], "artist": "Artist"} if not marked and kind == "album" else {}
+        _write_existing_audio(folder / f"{name}{extension}", quality, **tags)
+    if marked:
+        (folder / ".qobuz-album-id").write_text(album["id"], encoding="ascii")
+    client = _discovery_client(album, kind)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("discovery must not download, claim directories, or rewrite tags")
+
+    for method in ("_album_directory", "get_track_file_url", "download_track_file", "_download_file",
+                   "download_album_extras", "download_artist_poster", "embed_track_metadata"):
+        monkeypatch.setattr(client, method, forbidden)
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino)
+              for path in tmp_path.rglob("*") if path.is_file()}
+    item = {"kind": kind, "id": album["id"] if kind == "album" else "track-one"}
+    expected = folder if kind == "album" else folder / f"Song_ One [track-one]{extension}"
+    assert client.find_existing_purchase(item, tmp_path, quality) == expected
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino)
+            for path in tmp_path.rglob("*") if path.is_file()} == before
+    assert len(client.session.calls) == 1
+    assert client.session.calls[0]["url"].endswith(f"/{kind}/get")
+
+
+@pytest.mark.parametrize("kind", ["track", "album"])
+def test_discovery_prefers_marked_id_suffix_like_download_layout(tmp_path, discovery_album, kind):
+    for name in ("Album_ One", "Album_ One [album-test]"):
+        folder = tmp_path / "Artist" / name
+        for index, track in enumerate(discovery_album["tracks"]["items"], start=1):
+            filename = f"{index:02d}. {safe_filename(track['title'])}.flac" if kind == "album" else f"{safe_filename(track['title'])} [{track['id']}].flac"
+            _write_existing_audio(folder / filename)
+        (folder / ".qobuz-album-id").write_text("album-test\n", encoding="ascii")
+    client = _discovery_client(discovery_album, kind)
+    expected = folder if kind == "album" else folder / "Song_ One [track-one].flac"
+    assert client.find_existing_purchase({"kind": kind, "id": "album-test" if kind == "album" else "track-one"}, tmp_path, 6) == expected
+
+
+@pytest.mark.parametrize("kind", ["track", "album"])
+@pytest.mark.parametrize("relative", [False, True])
+def test_discovery_checks_explicit_legacy_path_but_does_not_scan(tmp_path, discovery_album, kind, relative):
+    folder = tmp_path / "Legacy Archive"
+    for index, track in enumerate(discovery_album["tracks"]["items"], start=1):
+        name = f"{index:02d}. {safe_filename(track['title'])}.flac" if kind == "album" else "old-filename.flac"
+        _write_existing_audio(folder / name, title=track["title"], album=discovery_album["title"], artist="Artist")
+        if kind == "track":
+            break
+    known = folder if kind == "album" else folder / "old-filename.flac"
+    item = {"kind": kind, "id": "album-test" if kind == "album" else "track-one"}
+    client = _discovery_client(discovery_album, kind)
+    assert client.find_existing_purchase(item, tmp_path, 6) is None
+    client = _discovery_client(discovery_album, kind)
+    assert client.find_existing_purchase(item, tmp_path, 6, known_path=str(known.relative_to(tmp_path) if relative else known)) == known
+    assert not (folder / ".qobuz-album-id").exists()
+
+
+@pytest.mark.parametrize("kind", ["track", "album"])
+def test_discovery_missing_root_does_not_create_directories(tmp_path, discovery_album, kind):
+    root = tmp_path / "missing"
+    client = _discovery_client(discovery_album, kind)
+    assert client.find_existing_purchase({"kind": kind, "id": "album-test" if kind == "album" else "track-one"}, root, 6,
+                                         known_path=root / "missing-legacy") is None
+    assert not root.exists()
+
+
+def test_known_track_path_is_not_identity_evidence_by_itself(tmp_path, discovery_album):
+    path = _write_existing_audio(tmp_path / "legacy" / "old-filename.flac")
+    client = _discovery_client(discovery_album, "track")
+    assert client.find_existing_purchase({"kind": "track", "id": "track-one"}, tmp_path, 6, known_path=path) is None
+
+
+@pytest.mark.parametrize("duration,found", [(None, True), ("unknown", True), (0, True), (2, True), (10, False)])
+def test_discovery_duration_tolerates_rounding_and_unavailable_metadata(tmp_path, discovery_album, duration, found):
+    discovery_album["tracks"]["items"][0]["duration"] = duration
+    path = _write_existing_audio(tmp_path / "Artist" / "Album_ One" / "Song_ One [track-one].flac")
+    client = _discovery_client(discovery_album, "track")
+    assert client.find_existing_purchase({"kind": "track", "id": "track-one"}, tmp_path, 6) == (path if found else None)
+
+
+@pytest.mark.parametrize("quality", [5, 6])
+@pytest.mark.parametrize("failure", ["missing", "empty", "magic", "malformed", "wrong-format", "wrong-extension", "part", "short", "metadata-only"])
+def test_discovery_rejects_invalid_or_incomplete_audio(tmp_path, discovery_album, quality, failure):
+    from mutagen.flac import FLAC
+    from mutagen.id3 import ID3, TIT2
+
+    extension = ".mp3" if quality == 5 else ".flac"
+    path = _write_existing_audio(tmp_path / "Artist" / "Album_ One" / f"Song_ One [track-one]{extension}", quality)
+    if failure == "missing":
+        path.unlink()
+    elif failure == "empty":
+        path.write_bytes(b"")
+    elif failure == "magic":
+        path.write_bytes(b"ID3\x04" if quality == 5 else b"fLaC")
+    elif failure == "malformed":
+        path.write_bytes(b"<html>not audio</html>")
+    elif failure == "wrong-format":
+        other = _write_existing_audio(tmp_path / ("other.flac" if quality == 5 else "other.mp3"), 6 if quality == 5 else 5)
+        path.write_bytes(other.read_bytes())
+    elif failure == "wrong-extension":
+        path.rename(path.with_suffix(".flac" if quality == 5 else ".mp3"))
+    elif failure == "part":
+        path.rename(path.with_suffix(extension + ".part"))
+    elif failure == "short":
+        discovery_album["tracks"]["items"][0]["duration"] = 200
+    elif quality == 5:
+        path.write_bytes(b"")
+        tags = ID3()
+        tags.add(TIT2(encoding=3, text=["Song: One"]))
+        tags.save(path)
+    else:
+        path.write_bytes(path.read_bytes()[:42])
+        assert FLAC(path).info.bitrate == 0
+    client = _discovery_client(discovery_album, "track")
+    assert client.find_existing_purchase({"kind": "track", "id": "track-one"}, tmp_path, quality, known_path=path) is None
+
+
+@pytest.mark.parametrize("marked", [False, True])
+@pytest.mark.parametrize("failure", ["missing", "empty", "malformed", "wrong-format", "part"])
+def test_discovery_requires_every_album_track(tmp_path, discovery_album, marked, failure):
+    folder = tmp_path / "Artist" / "Album_ One"
+    for index, track in enumerate(discovery_album["tracks"]["items"], start=1):
+        path = _write_existing_audio(folder / f"{index:02d}. {safe_filename(track['title'])}.flac",
+                                     title=track["title"], album=discovery_album["title"], artist="Artist")
+    if marked:
+        (folder / ".qobuz-album-id").write_text("album-test", encoding="ascii")
+    if failure == "missing":
+        path.unlink()
+    elif failure == "part":
+        path.rename(path.with_suffix(".flac.part"))
+    elif failure == "wrong-format":
+        path.write_bytes(_write_existing_audio(tmp_path / "other.mp3", 5).read_bytes())
+    else:
+        path.write_bytes(b"" if failure == "empty" else b"fLaCbroken")
+    client = _discovery_client(discovery_album, "album")
+    assert client.find_existing_purchase({"kind": "album", "id": "album-test"}, tmp_path, 6) is None
+
+
+@pytest.mark.parametrize("failure", ["untagged", "title", "album", "artist", "extra-track"])
+def test_unmarked_album_needs_raw_metadata_and_exact_filename_set(tmp_path, discovery_album, failure):
+    folder = tmp_path / "Artist" / "Album_ One"
+    for index, track in enumerate(discovery_album["tracks"]["items"], start=1):
+        tags = {"title": track["title"], "album": discovery_album["title"], "artist": "Artist"}
+        if failure == "untagged":
+            tags = {}
+        elif failure in tags and index == 2:
+            # Sanitized names can collide even though the raw release metadata differs.
+            tags[failure] = safe_filename(tags[failure]) if failure == "album" else "Other edition"
+        _write_existing_audio(folder / f"{index:02d}. {safe_filename(track['title'])}.flac", **tags)
+    if failure == "extra-track":
+        _write_existing_audio(folder / "03. Bonus.flac")
+    client = _discovery_client(discovery_album, "album")
+    assert client.find_existing_purchase({"kind": "album", "id": "album-test"}, tmp_path, 6) is None
+    assert not (folder / ".qobuz-album-id").exists()
+
+
+@pytest.mark.parametrize("kind", ["track", "album"])
+@pytest.mark.parametrize("marker", [b"other-album", b"", b"../invalid", b"\xff"])
+def test_discovery_rejects_conflicting_or_invalid_markers(tmp_path, discovery_album, kind, marker):
+    folder = tmp_path / "Artist" / "Album_ One"
+    for index, track in enumerate(discovery_album["tracks"]["items"], start=1):
+        name = f"{index:02d}. {safe_filename(track['title'])}.flac" if kind == "album" else f"{safe_filename(track['title'])} [{track['id']}].flac"
+        _write_existing_audio(folder / name, title=track["title"], album=discovery_album["title"], artist="Artist")
+    (folder / ".qobuz-album-id").write_bytes(marker)
+    client = _discovery_client(discovery_album, kind)
+    assert client.find_existing_purchase({"kind": kind, "id": "album-test" if kind == "album" else "track-one"}, tmp_path, 6) is None
+    assert (folder / ".qobuz-album-id").read_bytes() == marker
+
+
+@pytest.mark.parametrize("component", ["artist", "album", "audio", "marker", "known", "loop"])
+def test_discovery_rejects_escaping_or_looping_symlinks(tmp_path, discovery_album, component):
+    root = tmp_path / "downloads"
+    folder = root / "Artist" / "Album_ One"
+    path = _write_existing_audio(folder / "Song_ One [track-one].flac")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    known = None
+    if component in {"artist", "album"}:
+        target = folder.parent if component == "artist" else folder
+        target.rename(outside / "moved")
+        target.symlink_to(outside / "moved", target_is_directory=True)
+    elif component in {"audio", "loop"}:
+        path.rename(outside / "audio.flac")
+        path.symlink_to(path if component == "loop" else outside / "audio.flac")
+    elif component == "marker":
+        (outside / "marker").write_text("album-test", encoding="ascii")
+        (folder / ".qobuz-album-id").symlink_to(outside / "marker")
+    else:
+        path.rename(outside / path.name)
+        known = outside / path.name
+    client = _discovery_client(discovery_album, "track")
+    assert client.find_existing_purchase({"kind": "track", "id": "track-one"}, root, 6, known_path=known) is None
+
+
+def test_discovery_allows_symlinks_contained_in_root(tmp_path, discovery_album):
+    target = _write_existing_audio(tmp_path / "archive" / "audio.flac")
+    folder = tmp_path / "Artist" / "Album_ One"
+    folder.mkdir(parents=True)
+    path = folder / "Song_ One [track-one].flac"
+    path.symlink_to(target)
+    client = _discovery_client(discovery_album, "track")
+    assert client.find_existing_purchase({"kind": "track", "id": "track-one"}, tmp_path, 6) == path
+
+
+@pytest.mark.parametrize("failure", ["permission", "mutagen"])
+def test_discovery_tolerates_file_read_errors(tmp_path, monkeypatch, discovery_album, failure):
+    import mutagen
+
+    path = _write_existing_audio(tmp_path / "Artist" / "Album_ One" / "Song_ One [track-one].flac")
+
+    def fail(*args, **kwargs):
+        raise PermissionError("unreadable") if failure == "permission" else mutagen.MutagenError("broken stream")
+
+    monkeypatch.setattr(mutagen, "File", fail)
+    client = _discovery_client(discovery_album, "track")
+    assert client.find_existing_purchase({"kind": "track", "id": "track-one"}, tmp_path, 6, known_path=path) is None
+
+
+@pytest.mark.parametrize("quality", [5, 6])
+@pytest.mark.parametrize("alternate", [False, True])
+def test_partial_marked_album_reuses_only_valid_tracks_and_keeps_callbacks_and_extras(tmp_path, discovery_album, quality, alternate):
+    album = discovery_album
+    album["tracks"]["items"] = [{"id": f"track-{index}", "title": name, "duration": 1}
+                                for index, name in enumerate(["Valid", "Empty", "Malformed", "Wrong Format", "Partial", "Missing"], start=1)]
+    album["tracks"]["total"] = 6
+    folder = tmp_path / "Artist" / ("Album_ One [album-test]" if alternate else "Album_ One")
+    extension = ".mp3" if quality == 5 else ".flac"
+    valid = _write_existing_audio(folder / f"01. Valid{extension}", quality)
+    original = valid.read_bytes()
+    (folder / ".qobuz-album-id").write_text("album-test", encoding="ascii")
+    (folder / f"02. Empty{extension}").write_bytes(b"")
+    (folder / f"03. Malformed{extension}").write_bytes(b"ID3broken" if quality == 5 else b"fLaCbroken")
+    other = _write_existing_audio(tmp_path / ("other.flac" if quality == 5 else "other.mp3"), 6 if quality == 5 else 5)
+    (folder / f"04. Wrong Format{extension}").write_bytes(other.read_bytes())
+    partial = folder / f"05. Partial{extension}.part"
+    partial.write_bytes(original)
+    client = _discovery_client(album, "album")
+    item = {"kind": "album", "id": "album-test"}
+    assert client.find_existing_purchase(item, tmp_path, quality) is None
+    client.session.queue(album)
+    downloads, progress, embedded, extras = [], [], [], []
+
+    def download(track_id, destination, quality, **kwargs):
+        downloads.append(track_id)
+        return _write_existing_audio(destination, quality)
+
+    client.download_track_file = download
+    client.embed_track_metadata = lambda track, path, **kwargs: embedded.append(path)
+    client.download_album_extras = lambda album, path: extras.append(path) or []
+    client.download_artist_poster = lambda source, path: extras.append(path)
+    assert client.download_owned_item(item, tmp_path, quality, skip_existing=True,
+                                      track_progress_callback=lambda *args: progress.append(args)) == folder
+    assert downloads == [f"track-{index}" for index in range(2, 7)]
+    assert len(embedded) == 6
+    assert extras == [folder, folder.parent]
+    terminal = [event for event in progress if event[-1] == "downloaded"]
+    assert [event[1] for event in terminal] == [f"track-{index}" for index in range(1, 7)]
+    assert terminal[0][3:6] == (str(valid), len(original), len(original))
+    assert valid.read_bytes() == original
+    assert partial.read_bytes() == original
+
+
+@pytest.mark.parametrize("kind", ["track", "album"])
+@pytest.mark.parametrize("skip_existing", [None, False, True])
+def test_skip_existing_is_opt_in_and_force_redownloads(tmp_path, discovery_album, kind, skip_existing):
+    folder = tmp_path / "Artist" / "Album_ One"
+    for index, track in enumerate(discovery_album["tracks"]["items"], start=1):
+        name = f"{index:02d}. {safe_filename(track['title'])}.flac" if kind == "album" else f"{safe_filename(track['title'])} [{track['id']}].flac"
+        _write_existing_audio(folder / name)
+    (folder / ".qobuz-album-id").write_text("album-test", encoding="ascii")
+    client = _discovery_client(discovery_album, kind)
+    downloads = []
+
+    def download(track_id, destination, quality):
+        downloads.append(track_id)
+        return destination
+
+    client.download_track_file = download
+    client.embed_track_metadata = lambda *args, **kwargs: None
+    kwargs = {} if skip_existing is None else {"skip_existing": skip_existing}
+    client.download_owned_item({"kind": kind, "id": "album-test" if kind == "album" else "track-one"}, tmp_path, 6,
+                               include_extras=False, **kwargs)
+    assert downloads == ([] if skip_existing else ["track-one", "track-two"] if kind == "album" else ["track-one"])
+
+
+def test_skip_existing_does_not_claim_partial_unmarked_album(tmp_path, discovery_album):
+    folder = tmp_path / "Artist" / "Album_ One"
+    path = _write_existing_audio(folder / "01. Song_ One.flac", title="Song: One", album="Album: One", artist="Artist")
+    original = path.read_bytes()
+    client = _discovery_client(discovery_album, "album")
+    destinations = []
+
+    def download(track_id, destination, quality):
+        destinations.append(destination)
+        return destination
+
+    client.download_track_file = download
+    client.embed_track_metadata = lambda *args, **kwargs: None
+    result = client.download_owned_item({"kind": "album", "id": "album-test"}, tmp_path, 6, skip_existing=True, include_extras=False)
+    assert result == folder.with_name("Album_ One [album-test]")
+    assert len(destinations) == 2
+    assert all(path.parent == result for path in destinations)
+    assert not (folder / ".qobuz-album-id").exists()
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("quality,extra_suffix", [(6, ".mp3"), (6, ".MP3"), (6, ".FLAC"), (5, ".flac"), (5, ".FlAc"), (5, ".MP3")])
+def test_unmarked_album_rejects_extra_audio_across_both_formats(tmp_path, discovery_album, quality, extra_suffix):
+    folder = tmp_path / "Artist" / "Album_ One"
+    extension = ".mp3" if quality == 5 else ".flac"
+    for index, track in enumerate(discovery_album["tracks"]["items"], start=1):
+        _write_existing_audio(folder / f"{index:02d}. {safe_filename(track['title'])}{extension}", quality,
+                              title=track["title"], album=discovery_album["title"], artist="Artist")
+    _write_existing_audio(folder / f"01. Song_ One{extra_suffix}", 5 if extra_suffix.lower() == ".mp3" else 6,
+                          title="Unrelated track", album="Other edition", artist="Other artist")
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in folder.iterdir()}
+    client = _discovery_client(discovery_album, "album")
+    assert client.find_existing_purchase({"kind": "album", "id": "album-test"}, tmp_path, quality) is None
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in folder.iterdir()} == before
+
+
+@pytest.mark.parametrize("location", ["Artist/Album_ One [album-test]", "Legacy Archive"])
+def test_readonly_discovery_then_registration_writes_only_marker(tmp_path, discovery_album, location):
+    folder = tmp_path / location
+    for index, track in enumerate(discovery_album["tracks"]["items"], start=1):
+        _write_existing_audio(folder / f"{index:02d}. {safe_filename(track['title'])}.flac",
+                              title=track["title"], album=discovery_album["title"], artist="Artist")
+    (folder / "booklet.pdf").write_bytes(b"existing booklet")
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino) for path in folder.iterdir()}
+    client = _discovery_client(discovery_album, "album")
+    item = {"kind": "album", "id": "album-test"}
+    assert client.find_existing_purchase(item, tmp_path, 6, known_path=folder) == folder
+    assert set(folder.iterdir()) == set(before)
+    assert client.register_existing_purchase(item, tmp_path, folder.relative_to(tmp_path)) is None
+    marker = folder / ".qobuz-album-id"
+    assert marker.read_text(encoding="ascii") == "album-test"
+    marker_stat = marker.stat()
+    client.register_existing_purchase(item, tmp_path, folder)
+    assert marker.stat().st_ino == marker_stat.st_ino
+    assert marker.stat().st_mtime_ns == marker_stat.st_mtime_ns
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino)
+            for path in folder.iterdir() if path != marker} == before
+    assert len(client.session.calls) == 1  # Registration performs no API or media requests.
+
+
+def test_register_existing_track_is_noop(tmp_path):
+    client = QobuzClient("app-test", session=FakeSession())
+    assert client.register_existing_purchase({"kind": "track", "id": "track-one"}, tmp_path, tmp_path / "missing.flac") is None
+    assert list(tmp_path.iterdir()) == []
+    assert client.session.calls == []
+
+
+@pytest.mark.parametrize("failure", ["conflict", "symlink", "dangling", "escaping-marker", "directory-marker", "escaping-directory", "outside", "missing"])
+def test_registration_rejects_unsafe_or_conflicting_paths(tmp_path, failure):
+    root = tmp_path / "downloads"
+    folder = root / "Album"
+    folder.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = folder / ".qobuz-album-id"
+    target = root / "existing-marker"
+    target.write_text("album-test", encoding="ascii")
+    if failure == "conflict":
+        marker.write_text("other-album", encoding="ascii")
+    elif failure == "symlink":
+        marker.symlink_to(target)
+    elif failure == "dangling":
+        marker.symlink_to(root / "missing-marker")
+    elif failure == "escaping-marker":
+        target = outside / "existing-marker"
+        target.write_text("album-test", encoding="ascii")
+        marker.symlink_to(target)
+    elif failure == "directory-marker":
+        marker.mkdir()
+    elif failure == "escaping-directory":
+        folder.rmdir()
+        folder.symlink_to(outside, target_is_directory=True)
+    elif failure == "outside":
+        folder = outside
+    else:
+        folder = root / "missing"
+    before = set(tmp_path.rglob("*"))
+    client = QobuzClient("app-test", session=FakeSession())
+    with pytest.raises(QobuzError):
+        client.register_existing_purchase({"kind": "album", "id": "album-test"}, root, folder)
+    assert set(tmp_path.rglob("*")) == before
+    assert target.read_text(encoding="ascii") == "album-test"
+    if failure == "conflict":
+        assert marker.read_text(encoding="ascii") == "other-album"
+    assert client.session.calls == []
+
+
+@pytest.mark.parametrize("location,delete_directory", [
+    ("Artist/Album_ One [album-test]", False), ("Legacy Archive", False), ("Artist/Album_ One [album-test]", True),
+])
+@pytest.mark.parametrize("force", [False, True])
+def test_registered_album_repairs_and_forces_in_adopted_directory(tmp_path, discovery_album, location, delete_directory, force):
+    canonical = tmp_path / "Artist" / "Album_ One"
+    canonical.mkdir(parents=True)
+    (canonical / ".qobuz-album-id").write_text("other-edition", encoding="ascii")
+    (canonical / "01. Song_ One.flac").write_bytes(b"unrelated edition")
+    unrelated = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in canonical.iterdir()}
+    folder = tmp_path / location
+    for index, track in enumerate(discovery_album["tracks"]["items"], start=1):
+        _write_existing_audio(folder / f"{index:02d}. {safe_filename(track['title'])}.flac",
+                              title=track["title"], album=discovery_album["title"], artist="Artist")
+    client = _discovery_client(discovery_album, "album")
+    item = {"kind": "album", "id": "album-test"}
+    known = str(folder.relative_to(tmp_path)) if location == "Legacy Archive" or delete_directory else None
+    found = client.find_existing_purchase(item, tmp_path, 6, known_path=known)
+    assert found == folder
+    client.register_existing_purchase(item, tmp_path, found)
+    if delete_directory:
+        for path in folder.iterdir():
+            path.unlink()
+        folder.rmdir()
+    else:
+        (folder / "02. Song Two.flac").unlink()
+    client.session.queue(discovery_album)
+    downloads = []
+
+    def download(track_id, destination, quality):
+        downloads.append(track_id)
+        assert destination.parent == folder
+        return _write_existing_audio(destination, quality)
+
+    client.download_track_file = download
+    client.embed_track_metadata = lambda *args, **kwargs: None
+    assert client.download_owned_item(item, tmp_path, 6, known_path=known, skip_existing=not force, include_extras=False) == folder
+    assert downloads == (["track-one", "track-two"] if force or delete_directory else ["track-two"])
+    assert (folder / ".qobuz-album-id").read_text(encoding="ascii") == "album-test"
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in canonical.iterdir()} == unrelated
+
+
+@pytest.mark.parametrize("kind", ["album", "track"])
+def test_download_prefers_marked_known_legacy_directory_over_canonical(tmp_path, discovery_album, kind):
+    folder = tmp_path / "Legacy Archive"
+    canonical = tmp_path / "Artist" / "Album_ One"
+    for directory in (folder, canonical):
+        directory.mkdir(parents=True)
+        (directory / ".qobuz-album-id").write_text("album-test", encoding="ascii")
+    known = folder if kind == "album" else folder / "missing-old-name.flac"
+    client = _discovery_client(discovery_album, kind)
+    destinations = []
+
+    def download(track_id, destination, quality):
+        destinations.append(destination)
+        return destination
+
+    client.download_track_file = download
+    client.embed_track_metadata = lambda *args, **kwargs: None
+    client.download_owned_item({"kind": kind, "id": "album-test" if kind == "album" else "track-one"}, tmp_path, 6,
+                               known_path=known.relative_to(tmp_path), include_extras=False)
+    assert len(destinations) == (2 if kind == "album" else 1)
+    assert all(path.parent == folder for path in destinations)
+    assert list(canonical.iterdir()) == [canonical / ".qobuz-album-id"]
+
+
+@pytest.mark.parametrize("location", ["Artist/Album_ One", "Artist/Album_ One [album-test]", "Legacy Archive"])
+@pytest.mark.parametrize("marker", [None, "other-album"])
+def test_album_directory_does_not_claim_untrusted_known_directory(tmp_path, location, marker):
+    known = tmp_path / location
+    known.mkdir(parents=True)
+    if marker is not None:
+        (known / ".qobuz-album-id").write_text(marker, encoding="ascii")
+    before = {path: path.read_bytes() for path in known.iterdir()}
+    client = QobuzClient("app-test", session=FakeSession())
+    result = client._album_directory(tmp_path, tmp_path / "Artist", "Album_ One", "album-test", known_directory=known)
+    assert result != known
+    assert {path: path.read_bytes() for path in known.iterdir()} == before
+    assert (result / ".qobuz-album-id").read_text(encoding="ascii") == "album-test"
+
+
+@pytest.mark.parametrize("failure", ["directory", "marker", "track"])
+def test_known_download_path_rejects_unsafe_symlinks(tmp_path, discovery_album, failure):
+    root = tmp_path / "downloads"
+    folder = root / "Legacy Archive"
+    folder.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = folder / ".qobuz-album-id"
+    marker.write_text("album-test", encoding="ascii")
+    known = folder
+    if failure == "directory":
+        folder.rename(outside / "Album")
+        folder.symlink_to(outside / "Album", target_is_directory=True)
+    elif failure == "marker":
+        target = root / "marker"
+        marker.rename(target)
+        marker.symlink_to(target)
+    else:
+        known = folder / "missing.flac"
+        known.symlink_to(outside / "audio.flac")
+    kind = "track" if failure == "track" else "album"
+    client = _discovery_client(discovery_album, kind)
+    with pytest.raises(QobuzError):
+        client.download_owned_item({"kind": kind, "id": "track-one" if kind == "track" else "album-test"}, root, 6,
+                                   known_path=known, include_extras=False)
+    assert not (root / "Artist").exists()
+
+
+@pytest.mark.parametrize("audio_state", ["valid", "missing", "corrupt"])
+@pytest.mark.parametrize("skip_existing", [False, True])
+def test_adopted_unmarked_track_uses_known_file_without_claiming_folder(tmp_path, discovery_album, audio_state, skip_existing):
+    canonical = tmp_path / "Artist" / "Album_ One"
+    canonical.mkdir(parents=True)
+    (canonical / ".qobuz-album-id").write_text("other-edition", encoding="ascii")
+    (canonical / "Song_ One [track-one].flac").write_bytes(b"unrelated edition")
+    folder = canonical.with_name("Album_ One [album-test]")
+    known = _write_existing_audio(folder / "Song_ One [track-one].flac")
+    body = known.read_bytes()
+    (folder / "neighbor.mp3").write_bytes(b"unrelated audio")
+    (folder / "cover.jpg").write_bytes(b"existing cover")
+    (folder / "01. Booklet.pdf").write_bytes(b"existing booklet")
+    (folder.parent / "artist-poster.jpg").write_bytes(b"existing poster")
+    discovery_album["image"] = {"large": "https://static.example/cover.jpg"}
+    discovery_album["goodies"] = [{"name": "Booklet", "url": "https://static.example/booklet.pdf"}]
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in tmp_path.rglob("*") if path.is_file() and path != known}
+    client = _discovery_client(discovery_album, "track")
+    item = {"kind": "track", "id": "track-one"}
+    assert client.find_existing_purchase(item, tmp_path, 6) == known
+    client.register_existing_purchase(item, tmp_path, known)
+    if audio_state == "missing":
+        known.unlink()
+    elif audio_state == "corrupt":
+        known.write_bytes(b"fLaCbroken")
+    client.session.queue({**discovery_album["tracks"]["items"][0], "album": discovery_album})
+    needs_download = not skip_existing or audio_state != "valid"
+    if needs_download:
+        client.session.responses.append(StreamResponse(chunks=(body,), length=str(len(body))))
+    urls = []
+
+    def file_url(track_id, quality):
+        urls.append((track_id, quality))
+        return "https://cdn.example/audio.flac"
+
+    client.get_track_file_url = file_url
+    assert client.download_owned_item(item, tmp_path, 6, known_path=known.relative_to(tmp_path), skip_existing=skip_existing) == known
+    assert urls == ([("track-one", 6)] if needs_download else [])
+    assert len([call for call in client.session.calls if call["url"] == "https://cdn.example/audio.flac"]) == int(needs_download)
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in tmp_path.rglob("*") if path.is_file() and path != known} == before
+    assert not (folder / ".qobuz-album-id").exists()
+
+
+@pytest.mark.parametrize("quality", [5, 6])
+def test_non_id_legacy_track_force_uses_validated_filename_and_requested_extension(tmp_path, discovery_album, quality):
+    known = _write_existing_audio(tmp_path / "Legacy Archive" / "old-name.flac",
+                                  title="Song: One", album="Album: One", artist="Artist")
+    original = known.read_bytes()
+    client = _discovery_client(discovery_album, "track")
+    destinations = []
+
+    def download(track_id, destination, quality):
+        destinations.append(destination)
+        return _write_existing_audio(destination, quality)
+
+    client.download_track_file = download
+    expected = known.with_suffix(".mp3" if quality == 5 else ".flac")
+    assert client.download_owned_item({"kind": "track", "id": "track-one"}, tmp_path, quality,
+                                      known_path=known, skip_existing=False, include_extras=False) == expected
+    assert destinations == [expected]
+    if quality == 5:
+        assert known.read_bytes() == original
+    assert not (known.parent / ".qobuz-album-id").exists()
+
+
+@pytest.mark.parametrize("failure", ["wrong-tags", "wrong-id", "missing-non-id", "wrong-extension", "quality-collision", "marker", "symlink-marker"])
+def test_untrusted_known_track_does_not_overwrite_files(tmp_path, discovery_album, failure):
+    folder = tmp_path / "Legacy Archive"
+    name = "Song [track-one].flac" if failure in {"marker", "symlink-marker"} else "old-name.flac"
+    if failure == "wrong-id":
+        name = "Song [other-track].flac"
+    elif failure == "wrong-extension":
+        name = "Song [track-one].txt"
+    known = _write_existing_audio(folder / name, title="Wrong song" if failure in {"wrong-tags", "wrong-id"} else "Song: One",
+                                  album="Album: One", artist="Artist")
+    if failure == "missing-non-id":
+        known.unlink()
+    elif failure == "quality-collision":
+        _write_existing_audio(known.with_suffix(".mp3"), 5, title="Other song", album="Other album", artist="Other artist")
+    elif failure == "marker":
+        (folder / ".qobuz-album-id").write_text("other-album", encoding="ascii")
+    elif failure == "symlink-marker":
+        target = tmp_path / "marker"
+        target.write_text("album-test", encoding="ascii")
+        (folder / ".qobuz-album-id").symlink_to(target)
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in folder.iterdir()}
+    client = _discovery_client(discovery_album, "track")
+    destinations = []
+
+    def download(track_id, destination, quality):
+        destinations.append(destination)
+        return _write_existing_audio(destination, quality)
+
+    client.download_track_file = download
+    kwargs = {"known_path": known, "skip_existing": False, "include_extras": False}
+    item = {"kind": "track", "id": "track-one"}
+    if failure == "symlink-marker":
+        with pytest.raises(QobuzError):
+            client.download_owned_item(item, tmp_path, 6, **kwargs)
+        assert destinations == []
+    else:
+        result = client.download_owned_item(item, tmp_path, 5 if failure == "quality-collision" else 6, **kwargs)
+        assert result.parent != folder
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in folder.iterdir()} == before
