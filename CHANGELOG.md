@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.53
+
+- Fixes Qobuz Web Player browser-session paste behind Umbrel/reverse proxies by honoring forwarded origin headers.
+- Accepts browser storage row copies like `localuser\t{...}` in addition to the raw `localuser` JSON value.
+
 ## 0.1.50
 
 - Makes dashboard polling local-only, caches file metadata, and uses one non-overlapping browser polling loop with visible errors and session-expiry handling.
