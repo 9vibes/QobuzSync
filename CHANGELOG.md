@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.54
+
+- Fixes Save settings rejection when a reverse proxy replaces the browser-facing HTTPS scheme with HTTP, using browser same-origin fetch metadata when available.
+- Handles forwarded hosts without a forwarded scheme and preserves IPv6 host syntax during origin checks.
+- Retains authentication and cross-site request protection, with regression tests for empty settings, manual credentials, and pasted browser sessions.
+
 ## 0.1.53
 
 - Fixes Qobuz Web Player browser-session paste behind Umbrel/reverse proxies by honoring forwarded origin headers.

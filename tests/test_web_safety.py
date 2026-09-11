@@ -122,6 +122,15 @@ def test_settings_require_normalized_same_origin(state, base_url, origin, accept
     assert state.load_config().quality == (27 if accepted else before.quality)
 
 
+def test_settings_accept_ipv6_host(state):
+    client = TestClient(web.create_app())
+    response = client.post("/settings", data={"quality": "27"}, headers={
+        "Host": "[::1]:28080",
+        "Origin": "http://[::1]:28080",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+
+
 def test_settings_accept_proxy_forwarded_same_origin(state):
     client = TestClient(web.create_app(), base_url="http://qobuz-sync:23809")
 
@@ -165,10 +174,72 @@ def test_settings_reject_proxy_forwarded_cross_origin(state):
     assert state.load_config().quality == before.quality
 
 
+@pytest.mark.parametrize("credentials", [
+    {},
+    {"qobuz_user_id": "123", "qobuz_user_auth_token": "test-token"},
+    {"qobuz_localuser": '{"id":123,"token":"test-token"}'},
+])
+@pytest.mark.parametrize(("fetch_site", "accepted"), [
+    ("same-origin", True),
+    ("same-site", False),
+    ("cross-site", False),
+    ("none", False),
+    ("", False),
+])
+def test_settings_behind_proxy_that_overwrites_https_scheme(state, credentials, fetch_site, accepted):
+    client = TestClient(web.create_app(), base_url="http://umbrel.example")
+    before = state.load_config()
+    headers = {
+        "Origin": "https://umbrel.example",
+        "X-Forwarded-Host": "umbrel.example",
+        "X-Forwarded-Proto": "http",
+    }
+    if fetch_site:
+        headers["Sec-Fetch-Site"] = fetch_site
+
+    response = client.post("/settings", data={"quality": "27", **credentials}, headers=headers, follow_redirects=False)
+
+    assert response.status_code == (303 if accepted else 403)
+    if accepted:
+        config = state.load_config()
+        assert config.quality == 27
+        assert config.qobuz_user_id == ("123" if credentials else "")
+        assert config.qobuz_user_auth_token == ("test-token" if credentials else "")
+    else:
+        assert state.load_config() == before
+
+
+@pytest.mark.parametrize("origin", ["http://umbrel.local:28080", "http://evil.test:28080"])
+def test_forwarded_host_without_forwarded_proto(state, origin):
+    client = TestClient(web.create_app(), base_url="http://qobuz-sync:23809")
+    response = client.post("/settings", data={"quality": "27"}, headers={
+        "Origin": origin,
+        "X-Forwarded-Host": "umbrel.local:28080",
+    }, follow_redirects=False)
+    assert response.status_code == (303 if origin == "http://umbrel.local:28080" else 403)
+
+
+def test_same_origin_fetch_metadata_does_not_bypass_authentication(state, monkeypatch):
+    monkeypatch.setenv("QOBUZ_SYNC_AUTH_TOKEN", "test-access-token")
+    client = TestClient(web.create_app(), base_url="http://umbrel.example")
+    before = state.load_config()
+    response = client.post("/settings", data={"quality": "27"}, headers={
+        "Origin": "https://umbrel.example",
+        "Sec-Fetch-Site": "same-origin",
+    }, follow_redirects=False)
+    assert response.status_code == 401
+    assert state.load_config() == before
+
+
+@pytest.mark.parametrize("fetch_site", ["cross-site", "same-site"])
+@pytest.mark.parametrize("origin", [None, "http://testserver"])
 @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
-def test_cross_site_mutations_without_origin_are_rejected(state, method):
+def test_cross_site_mutations_are_rejected(state, method, origin, fetch_site):
     client = TestClient(web.create_app())
-    response = client.request(method, "/settings", headers={"Sec-Fetch-Site": "cross-site"})
+    headers = {"Sec-Fetch-Site": fetch_site}
+    if origin:
+        headers["Origin"] = origin
+    response = client.request(method, "/settings", headers=headers)
     assert response.status_code == 403
 
 

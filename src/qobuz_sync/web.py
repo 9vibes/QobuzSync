@@ -67,12 +67,12 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):
         if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+            if request.headers.get("sec-fetch-site") in {"cross-site", "same-site"}:
+                return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
             origin = request.headers.get("origin", "")
             if origin:
                 if not is_same_origin_request(request, origin):
                     return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
-            elif request.headers.get("sec-fetch-site") == "cross-site":
-                return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
         if request.url.path in {"/health", "/login"}:
             return await call_next(request)
         configured_token = auth_token()
@@ -303,10 +303,15 @@ def is_same_origin_request(request: Request, origin: str) -> bool:
     if not origin_normalized:
         return False
 
+    # Browsers set this forbidden header from the public URL. Unlike forwarded
+    # headers, it survives a proxy replacing the external HTTPS scheme with HTTP.
+    if request.headers.get("sec-fetch-site") == "same-origin":
+        return True
+
     candidates = {
-        origin_parts(request.url.scheme, request.url.hostname or "", request.url.port),
+        origin_parts(request.url.scheme, request.url.netloc),
     }
-    forwarded_proto = forwarded_value(request, "x-forwarded-proto")
+    forwarded_proto = forwarded_value(request, "x-forwarded-proto") or request.url.scheme
     forwarded_host = forwarded_value(request, "x-forwarded-host") or forwarded_value(request, "host")
     if forwarded_proto and forwarded_host:
         candidates.add(origin_parts(forwarded_proto, forwarded_host, forwarded_port(request)))
