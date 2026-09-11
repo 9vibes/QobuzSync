@@ -5,6 +5,7 @@ import json
 import logging
 import mimetypes
 import os
+import secrets
 import threading
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -13,6 +14,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .state import AppConfig, DEFAULT_DOWNLOAD_DIR, SyncState
 from .sync import SyncService, _safe_message
@@ -20,6 +22,7 @@ from .sync import SyncService, _safe_message
 
 SYNC_JOB_LOCK = threading.Lock()
 AUTH_COOKIE_NAME = "qobuz_sync_session"
+CSRF_COOKIE_NAME = "qobuz_sync_csrf"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -43,6 +46,7 @@ def data_dir() -> Path:
 def create_app() -> FastAPI:
     state = SyncState(data_dir() / "qobuz-sync.db")
     stop_event = threading.Event()
+    csrf_secret = secrets.token_bytes(32)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -66,17 +70,39 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):
+        csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME, "")
+        csrf_nonce = csrf_cookie or secrets.token_urlsafe(32)
+        request.state.csrf_token = hmac.new(csrf_secret, csrf_nonce.encode("utf-8"), "sha256").hexdigest()
         if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
             if request.headers.get("sec-fetch-site") in {"cross-site", "same-site"}:
                 return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
             origin = request.headers.get("origin", "")
-            if origin:
+            if origin == "null":
+                provided_csrf = request.headers.get("x-csrf-token", "")
+                if not provided_csrf and csrf_cookie:
+                    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                    if content_type in {"application/x-www-form-urlencoded", "multipart/form-data"}:
+                        body = bytearray()
+                        async for chunk in request.stream():
+                            if len(body) + len(chunk) > 64 * 1024:
+                                return JSONResponse({"detail": "Form is too large"}, status_code=413)
+                            body.extend(chunk)
+                        # Starlette's cached request replays this bounded body to FastAPI.
+                        request._body = bytes(body)
+                        try:
+                            async with request.form() as form:
+                                provided_csrf = form.get("csrf_token", "")
+                        except (StarletteHTTPException, ValueError):
+                            provided_csrf = ""
+                if not (csrf_cookie and isinstance(provided_csrf, str) and hmac.compare_digest(
+                    provided_csrf.encode("utf-8"), request.state.csrf_token.encode("utf-8")
+                )):
+                    return JSONResponse({"detail": "Form verification failed. Reload the app page and try again."}, status_code=403)
+            elif origin:
                 if not is_same_origin_request(request, origin):
                     return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
-        if request.url.path in {"/health", "/login"}:
-            return await call_next(request)
         configured_token = auth_token()
-        if configured_token:
+        if configured_token and request.url.path not in {"/health", "/login"}:
             expected = configured_token
             provided = (request.headers.get("authorization", "") or "").removeprefix("Bearer ").strip()
             if not provided:
@@ -89,6 +115,8 @@ def create_app() -> FastAPI:
                     return RedirectResponse("/login", status_code=303)
                 return JSONResponse({"detail": "Authentication required"}, status_code=401)
         response = await call_next(request)
+        if not csrf_cookie and request.url.path in {"/", "/login"} and response.headers.get("content-type", "").startswith("text/html"):
+            response.set_cookie(CSRF_COOKIE_NAME, csrf_nonce, httponly=True, samesite="lax", secure=request.url.scheme == "https")
         response.headers["X-Content-Type-Options"] = "nosniff"
         if request.url.path.startswith(("/art/", "/progress-art/")):
             response.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
@@ -100,14 +128,14 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     @app.get("/login", response_class=HTMLResponse)
-    def login_page() -> str:
-        return render_login()
+    def login_page(request: Request) -> str:
+        return render_login(csrf_token=request.state.csrf_token)
 
     @app.post("/login")
     def login_submit(request: Request, token: str = Form("")) -> Response:
         configured_token = auth_token()
         if not configured_token or not (token and hmac.compare_digest(token.strip().encode("utf-8"), configured_token.encode("utf-8"))):
-            return HTMLResponse(render_login(error="Incorrect access token"), status_code=401)
+            return HTMLResponse(render_login(error="Incorrect access token", csrf_token=request.state.csrf_token), status_code=401)
         response = RedirectResponse("/", status_code=303)
         response.set_cookie(AUTH_COOKIE_NAME, session_token(configured_token), secure=request.url.scheme == "https", httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
         return response
@@ -133,6 +161,7 @@ def create_app() -> FastAPI:
             total_downloads=total_downloads,
             progress=progress,
             track_progress=track_progress,
+            csrf_token=request.state.csrf_token,
         )
 
     @app.get("/art/{kind}/{purchase_id}")
@@ -394,6 +423,7 @@ def render_home(
     total_downloads: int | None = None,
     progress: dict | None = None,
     track_progress: list[dict] | None = None,
+    csrf_token: str = "",
 ) -> str:
     configured = "Configured" if config.is_configured else "Not configured"
     status_class = "ready" if config.is_configured else "needs-setup"
@@ -695,8 +725,8 @@ def render_home(
         <h1>Your Qobuz library, beautifully archived.</h1>
         <p>Monitor purchased albums and tracks, sync them to your Umbrel Downloads/QobuzSync folder, and keep artwork, and metadata in one place for Navidrome or your preferred music server to digest.</p>
         <div class="hero-actions">
-          <form id="sync-now-form" class="sync-form" method="post" action="/sync-now"><button id="sync-now-button" type="submit">Sync now</button><span id="sync-now-check" class="sync-check" aria-live="polite" aria-label="Sync started">✓</span></form>
-          <form id="resync-all-form" class="sync-form" method="post" action="/resync-all"><button id="resync-all-button" class="danger-button" type="submit">Re Sync Entire Library</button><span id="resync-all-check" class="sync-check" aria-label="Library re-sync started">✓</span></form>
+          <form id="sync-now-form" class="sync-form" method="post" action="/sync-now"><input type="hidden" name="csrf_token" value="{escape(csrf_token)}"><button id="sync-now-button" type="submit">Sync now</button><span id="sync-now-check" class="sync-check" aria-live="polite" aria-label="Sync started">✓</span></form>
+          <form id="resync-all-form" class="sync-form" method="post" action="/resync-all"><input type="hidden" name="csrf_token" value="{escape(csrf_token)}"><button id="resync-all-button" class="danger-button" type="submit">Re Sync Entire Library</button><span id="resync-all-check" class="sync-check" aria-label="Library re-sync started">✓</span></form>
         </div>
         <p id="action-feedback" role="status" aria-live="polite"></p>
       </div>
@@ -728,6 +758,7 @@ def render_home(
           <section>
             <h2>Settings</h2>
             <form method="post" action="/settings">
+              <input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
               <div class="field-grid">
                 <label class="wide-field"><span>Paste Qobuz browser session</span><input name="qobuz_localuser" type="password" autocomplete="off" value="" placeholder="{localuser_note}"></label>
                 <label><span>Qobuz user ID</span><input name="qobuz_user_id" value="{escape(config.qobuz_user_id)}" placeholder="Required with auth token"></label>
@@ -900,7 +931,7 @@ def render_home(
     try {{
       const response = await fetch(form.action, {{
         method: 'POST',
-        headers: {{ 'Accept': 'application/json', 'X-Requested-With': 'fetch' }},
+        headers: {{ 'Accept': 'application/json', 'X-Requested-With': 'fetch', 'X-CSRF-Token': form.elements.csrf_token.value }},
         signal: AbortSignal.timeout(10000),
       }});
       if (response.status === 401) {{
@@ -1251,7 +1282,7 @@ def escape(value: object) -> str:
     )
 
 
-def render_login(*, error: str = "") -> str:
+def render_login(*, error: str = "", csrf_token: str = "") -> str:
     error_html = f'<p class="login-error">{escape(error)}</p>' if error else ""
     return f"""<!doctype html>
 <html lang="en">
@@ -1292,6 +1323,7 @@ def render_login(*, error: str = "") -> str:
 </head>
 <body>
   <form method="post" action="/login">
+    <input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
     <h1>Qobuz Sync</h1>
     <p>Enter the access token to open the dashboard. Set <code>QOBUZ_SYNC_AUTH_TOKEN</code> on the service to change it.</p>
     {error_html}

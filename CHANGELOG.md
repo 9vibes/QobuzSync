@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.55
+
+- Accepts Safari form submissions with `Origin: null` when a signed, browser-bound CSRF token is valid, while retaining authentication and cross-site request protection.
+- Adds form tokens to settings, login, and sync actions, with reload guidance for expired forms after an app restart.
+- Bounds CSRF form parsing to 64 KiB and safely rejects malformed multipart data.
+- Adds regression coverage for null-origin saves, missing or tampered tokens, login, sync, and form parsing limits.
+
 ## 0.1.54
 
 - Fixes Save settings rejection when a reverse proxy replaces the browser-facing HTTPS scheme with HTTP, using browser same-origin fetch metadata when available.

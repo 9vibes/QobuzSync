@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, call
@@ -120,6 +121,145 @@ def test_settings_require_normalized_same_origin(state, base_url, origin, accept
 
     assert response.status_code == (303 if accepted else 403)
     assert state.load_config().quality == (27 if accepted else before.quality)
+
+
+def form_token(response):
+    return re.search(r'name="csrf_token" value="([a-f0-9]{64})"', response.text).group(1)
+
+
+@pytest.mark.parametrize(("credentials", "status"), [
+    ({}, 303),
+    ({"qobuz_user_id": "123", "qobuz_user_auth_token": "test-token"}, 303),
+    ({"qobuz_localuser": '{"id":123,"token":"test-token"}'}, 303),
+    ({"qobuz_localuser": "not-a-session"}, 422),
+])
+@pytest.mark.parametrize("multipart", [False, True])
+def test_safari_null_origin_settings_with_browser_bound_form_token(state, credentials, status, multipart):
+    client = TestClient(web.create_app(), base_url="http://192.0.2.10:28080")
+    home = client.get("/")
+    token = form_token(home)
+    assert home.text.count(f'name="csrf_token" value="{token}"') == 3
+    assert token != client.cookies[web.CSRF_COOKIE_NAME]
+    assert "httponly" in home.headers["set-cookie"].lower()
+    assert home.headers["cache-control"] == "no-store"
+    before = state.load_config()
+    data = {"csrf_token": token, "quality": "27", "include_albums": "on", **credentials}
+    body = {"files": {key: (None, value) for key, value in data.items()}} if multipart else {"data": data}
+
+    response = client.post("/settings", headers={"Origin": "null"}, follow_redirects=False, **body)
+
+    assert response.status_code == status
+    if status == 303:
+        config = state.load_config()
+        assert config.quality == 27
+        assert config.include_albums is True
+        assert config.qobuz_user_id == ("123" if credentials else "")
+        assert config.qobuz_user_auth_token == ("test-token" if credentials else "")
+    else:
+        assert state.load_config() == before
+
+
+@pytest.mark.parametrize("invalid", ["missing-token", "tampered-token", "missing-cookie", "tampered-cookie", "other-browser", "cookie-as-token"])
+def test_null_origin_rejects_invalid_csrf_proof(state, invalid):
+    app = web.create_app()
+    client = TestClient(app)
+    token = form_token(client.get("/"))
+    if invalid == "missing-token":
+        token = ""
+    elif invalid == "tampered-token":
+        token += "x"
+    elif invalid == "missing-cookie":
+        client.cookies.clear()
+    elif invalid == "tampered-cookie":
+        client.cookies.clear()
+        client.cookies.set(web.CSRF_COOKIE_NAME, "attacker-chosen-cookie")
+    elif invalid == "other-browser":
+        token = form_token(TestClient(app).get("/"))
+    else:
+        token = client.cookies[web.CSRF_COOKIE_NAME]
+    before = state.load_config()
+    response = client.post("/settings", data={"csrf_token": token, "quality": "27"}, headers={"Origin": "null"})
+    assert response.status_code == 403
+    assert "Reload" in response.json()["detail"]
+    assert state.load_config() == before
+
+
+def test_null_origin_stale_form_requires_reload_after_restart(state):
+    original = TestClient(web.create_app())
+    old_token = form_token(original.get("/"))
+    restarted = TestClient(web.create_app())
+    restarted.cookies.update(original.cookies)
+    headers = {"Origin": "null"}
+    response = restarted.post("/settings", data={"csrf_token": old_token}, headers=headers)
+    assert response.status_code == 403
+    new_token = form_token(restarted.get("/"))
+    assert new_token != old_token
+    assert restarted.post("/settings", data={"csrf_token": new_token}, headers=headers, follow_redirects=False).status_code == 303
+
+
+@pytest.mark.parametrize("content_type", ["multipart/form-data", "multipart/form-data; boundary=foo"])
+def test_null_origin_malformed_form_is_rejected(state, content_type):
+    client = TestClient(web.create_app())
+    client.get("/")
+    response = client.post("/settings", content=b"not multipart", headers={
+        "Origin": "null", "Content-Type": content_type,
+    })
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_null_origin_form_body_is_bounded_before_parsing(state, chunked):
+    client = TestClient(web.create_app())
+    client.get("/")
+    before = state.load_config()
+    body = b"qobuz_localuser=" + b"x" * (64 * 1024)
+    content = (body[i:i + 8192] for i in range(0, len(body), 8192)) if chunked else body
+    response = client.post("/settings", content=content, headers={
+        "Origin": "null", "Content-Type": "application/x-www-form-urlencoded",
+    })
+    assert response.status_code == 413
+    assert state.load_config() == before
+
+
+@pytest.mark.parametrize("headers", [
+    {"Origin": "http://evil.test"},
+    {"Origin": "null", "Sec-Fetch-Site": "cross-site"},
+    {"Origin": "null", "Sec-Fetch-Site": "same-site"},
+])
+def test_csrf_token_does_not_override_explicit_cross_site_request(state, headers):
+    client = TestClient(web.create_app())
+    token = form_token(client.get("/"))
+    response = client.post("/settings", data={"csrf_token": token, "quality": "27"}, headers=headers)
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("path", ["/sync-now", "/resync-all"])
+def test_null_origin_sync_uses_csrf_header(state, monkeypatch, path):
+    thread = Mock()
+    monkeypatch.setattr(web.threading, "Thread", thread)
+    client = TestClient(web.create_app())
+    home = client.get("/")
+    assert "'X-CSRF-Token': form.elements.csrf_token.value" in home.text
+    response = client.post(path, headers={"Origin": "null", "X-CSRF-Token": form_token(home), "Accept": "application/json"})
+    assert response.status_code == 200
+    assert response.json()["started"] is True
+    thread.return_value.start.assert_called_once()
+
+
+def test_null_origin_login_retry_and_settings_authentication(state, monkeypatch):
+    monkeypatch.setenv("QOBUZ_SYNC_AUTH_TOKEN", "test-access-token")
+    client = TestClient(web.create_app())
+    login = client.get("/login")
+    token = form_token(login)
+    assert login.headers["cache-control"] == "no-store"
+    headers = {"Origin": "null"}
+    assert client.post("/settings", data={"csrf_token": token}, headers=headers).status_code == 401
+    wrong = client.post("/login", data={"csrf_token": token, "token": "wrong"}, headers=headers)
+    assert wrong.status_code == 401
+    assert form_token(wrong) == token
+    logged_in = client.post("/login", data={"csrf_token": token, "token": "test-access-token"}, headers=headers, follow_redirects=False)
+    assert logged_in.status_code == 303
+    assert client.post("/settings", data={"csrf_token": token}, headers=headers, follow_redirects=False).status_code == 303
 
 
 def test_settings_accept_ipv6_host(state):
