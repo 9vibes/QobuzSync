@@ -3,9 +3,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import os
 import re
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -95,7 +99,7 @@ def discover_web_credentials(session: requests.Session | None = None, timeout: i
         try:
             decoded = base64.standard_b64decode("".join(parts)[:-44]).decode("utf-8")
         except Exception as exc:  # pragma: no cover - web bundle shape varies
-            LOGGER.debug("Skipping undecodable Qobuz secret: %s", exc)
+            LOGGER.debug("Skipping undecodable Qobuz secret: %s", type(exc).__name__)
             continue
         if decoded:
             decoded_secrets.append(decoded)
@@ -122,10 +126,12 @@ class QobuzClient:
         self.timeout = timeout
         self.user_auth_token: str | None = None
         self.active_secret: str | None = None
+        # Media requests share this session, so credentials must be request-local.
+        self.session.headers.pop("X-User-Auth-Token", None)
+        self.session.headers.pop("X-App-Id", None)
         self.session.headers.update(
             {
                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) QobuzSync/0.1",
-                "X-App-Id": self.app_id,
                 "Content-Type": "application/json;charset=UTF-8",
             }
         )
@@ -143,7 +149,6 @@ class QobuzClient:
         if not token:
             raise AuthenticationError("Qobuz login did not return a user auth token")
         self.user_auth_token = token
-        self.session.headers.update({"X-User-Auth-Token": token})
         user = payload.get("user", {}) if isinstance(payload.get("user"), dict) else {}
         credentials = user.get("credential", {}).get("parameters") if isinstance(user.get("credential"), dict) else None
         subscription = user.get("subscription") if isinstance(user.get("subscription"), dict) else None
@@ -174,18 +179,37 @@ class QobuzClient:
     def iter_purchases(self, purchase_type: PurchaseApiType) -> list[dict[str, Any]]:
         """Fetch every purchased album or track page and normalize to item dictionaries."""
         items: list[dict[str, Any]] = []
-        offset = 0
-        limit = 500
+        seen: set[str] = set()
+        total: int | None = None
         while True:
-            payload = self.get_purchases(purchase_type, limit=limit, offset=offset)
+            offset = len(items)
+            payload = self.get_purchases(purchase_type, limit=500, offset=offset)
             block = payload.get(purchase_type, payload)
-            page_items = block.get("items", []) if isinstance(block, dict) else []
-            items.extend(page_items)
-            total = int(block.get("total", len(items))) if isinstance(block, dict) else len(items)
-            if len(items) >= total or not page_items:
-                break
-            offset += limit
-        return items
+            if not isinstance(block, dict) or not isinstance(block.get("items"), list):
+                raise QobuzError("Invalid purchase page")
+            if not re.fullmatch(r"[0-9]+", str(block.get("total", ""))):
+                raise QobuzError("Invalid or missing purchase total")
+            page_total = int(block["total"])
+            if total is not None and page_total != total:
+                raise QobuzError("Purchase total changed during pagination")
+            total = page_total
+            if "offset" in block and str(block["offset"]) != str(offset):
+                raise QobuzError("Unexpected purchase page offset")
+            page_items = block["items"]
+            if not page_items and offset < total:
+                raise QobuzError("Incomplete purchase listing")
+            for item in page_items:
+                if not isinstance(item, dict):
+                    raise QobuzError("Invalid purchase metadata")
+                item_id = self._safe_id(item.get("id"))
+                if item_id in seen:
+                    raise QobuzError("Duplicate item in purchase listing")
+                seen.add(item_id)
+                items.append(item)
+            if len(items) > total:
+                raise QobuzError("Inconsistent purchase total")
+            if len(items) == total:
+                return items
 
     def list_owned_items(self, *, include_albums: bool = True, include_tracks: bool = True) -> list[dict[str, str]]:
         owned: list[dict[str, str]] = []
@@ -198,7 +222,46 @@ class QobuzClient:
         return [item for item in owned if item["id"] and item["id"] != "None"]
 
     def get_album(self, album_id: str) -> dict[str, Any]:
-        return self._get("album/get", album_id=album_id)
+        album = self._get("album/get", album_id=album_id, limit=500, offset=0)
+        block = album.get("tracks")
+        if not isinstance(block, dict) or not isinstance(block.get("items"), list):
+            raise QobuzError(f"Album {album_id} did not include track metadata")
+        if "offset" in block and str(block["offset"]) != "0":
+            raise QobuzError(f"Album {album_id} returned the wrong track page")
+        tracks: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        try:
+            total = int(block.get("total", album.get("tracks_count", len(block["items"]))))
+            if "tracks_count" in album and int(album["tracks_count"]) != total:
+                raise ValueError("inconsistent totals")
+        except (ValueError, TypeError) as exc:
+            raise QobuzError(f"Album {album_id} has invalid track totals") from exc
+        while True:
+            page = block.get("items")
+            if not isinstance(page, list) or not page:
+                raise QobuzError(f"Album {album_id} has an incomplete track listing")
+            for track in page:
+                if not isinstance(track, dict):
+                    raise QobuzError(f"Album {album_id} has invalid track metadata")
+                track_id = self._safe_id(track.get("id"))
+                if track_id in seen:
+                    raise QobuzError(f"Album {album_id} repeats track {track_id}")
+                seen.add(track_id)
+                tracks.append(track)
+            if len(tracks) > total:
+                raise QobuzError(f"Album {album_id} has inconsistent track totals")
+            if len(tracks) == total:
+                break
+            payload = self._get("album/get", album_id=album_id, limit=500, offset=len(tracks))
+            block = payload.get("tracks")
+            if not isinstance(block, dict):
+                raise QobuzError(f"Album {album_id} has an incomplete track listing")
+            if str(block.get("total", total)) != str(total):
+                raise QobuzError(f"Album {album_id} track total changed during pagination")
+            if "offset" in block and str(block["offset"]) != str(len(tracks)):
+                raise QobuzError(f"Album {album_id} returned the wrong track page")
+        album["tracks"] = {**album["tracks"], "items": tracks, "total": total}
+        return album
 
     def get_track(self, track_id: str) -> dict[str, Any]:
         return self._get("track/get", track_id=track_id)
@@ -258,15 +321,16 @@ class QobuzClient:
         metadata and download each track into one album folder.
         """
         kind = item["kind"]
-        item_id = str(item["id"])
-        root = Path(download_dir)
+        item_id = self._safe_id(item["id"])
+        root = Path(download_dir).resolve()
+        extension = ".mp3" if quality == 5 else ".flac"
         if kind == "track":
             track = self.get_track(item_id)
             album = track.get("album", {}) if isinstance(track.get("album"), dict) else {}
             title = self._track_title_only(track)
-            artist_dir = root / safe_filename(self._track_artist_name(track, album))
-            album_dir = artist_dir / safe_filename(self._album_title_only(album) if album else "Singles")
-            destination = album_dir / f"{safe_filename(title)} [{item_id}].flac"
+            artist_dir = self._contained_path(root, root / safe_filename(self._track_artist_name(track, album)))
+            album_dir = self._album_directory(root, artist_dir, self._album_title_only(album) if album else "Singles", album.get("id"))
+            destination = self._contained_path(root, album_dir / f"{safe_filename(title)} [{item_id}]{extension}")
             if progress_callback:
                 progress_callback(1, 1, title)
             if track_progress_callback:
@@ -291,8 +355,8 @@ class QobuzClient:
         if kind == "album":
             album = self.get_album(item_id)
             album_title = self._album_title_only(album)
-            artist_dir = root / safe_filename(self._album_artist_name(album))
-            album_dir = artist_dir / safe_filename(album_title)
+            artist_dir = self._contained_path(root, root / safe_filename(self._album_artist_name(album)))
+            album_dir = self._album_directory(root, artist_dir, album_title, item_id)
             tracks_block = album.get("tracks", {}) if isinstance(album.get("tracks"), dict) else {}
             tracks = tracks_block.get("items", []) if isinstance(tracks_block, dict) else []
             if not tracks:
@@ -304,11 +368,12 @@ class QobuzClient:
             last_path = album_dir
             total_tracks = len(tracks)
             for index, track in enumerate(tracks, start=1):
-                track_id = str(track.get("id"))
+                track_id = self._safe_id(track.get("id"))
                 title = self._track_title_only(track)
                 if progress_callback:
                     progress_callback(index, total_tracks, title)
-                destination = album_dir / f"{index:02d}. {safe_filename(title)}.flac"
+                # A single album-wide index stays unique across discs and preserves legacy paths.
+                destination = self._contained_path(root, album_dir / f"{index:02d}. {safe_filename(title)}{extension}")
                 if track_progress_callback:
                     track_progress_callback("track", track_id, title, str(destination), 0, 0, "downloading")
                 track_byte_progress = None
@@ -330,9 +395,10 @@ class QobuzClient:
     def download_owned_item_extras(self, item: dict[str, str], downloaded_path: str | Path) -> list[Path]:
         """Download missing cover/goodie files for an already-recorded purchase."""
         kind = item["kind"]
-        item_id = str(item["id"])
+        item_id = self._safe_id(item["id"])
         path = Path(downloaded_path)
         if kind == "track":
+            self._contained_path(path.parent, path)
             track = self.get_track(item_id)
             written = self.download_album_extras(track.get("album", {}), path.parent)
             if path.exists():
@@ -346,8 +412,10 @@ class QobuzClient:
             tracks = tracks_block.get("items", []) if isinstance(tracks_block, dict) else []
             total_tracks = len(tracks)
             for index, track in enumerate(tracks, start=1):
-                for flac_path in sorted(path.glob(f"{index:02d}. *.flac")):
-                    self.embed_track_metadata(track, flac_path, album=album, cover_path=cover_path, track_number=index, track_total=total_tracks)
+                for extension in (".flac", ".mp3"):
+                    audio_path = self._contained_path(path, path / f"{index:02d}. {safe_filename(self._track_title_only(track))}{extension}")
+                    if audio_path.is_file():
+                        self.embed_track_metadata(track, audio_path, album=album, cover_path=cover_path, track_number=index, track_total=total_tracks)
             return written
         raise ValueError("item kind must be 'album' or 'track'")
 
@@ -361,7 +429,9 @@ class QobuzClient:
         cover_url = image.get("large") or image.get("small") or image.get("thumbnail")
         if cover_url:
             suffix = Path(str(cover_url).split("?", 1)[0]).suffix or ".jpg"
-            written.append(self.download_url_file(str(cover_url), album_dir / f"cover{suffix}"))
+            cover = self._download_extra(str(cover_url), album_dir, f"cover{safe_filename(suffix)}")
+            if cover:
+                written.append(cover)
         for index, goodie in enumerate(album.get("goodies") or [], start=1):
             if not isinstance(goodie, dict):
                 continue
@@ -370,13 +440,29 @@ class QobuzClient:
                 continue
             title = safe_filename(str(goodie.get("description") or goodie.get("name") or goodie.get("title") or f"extra-{index}"))
             suffix = Path(str(url).split("?", 1)[0]).suffix or ".bin"
-            written.append(self.download_url_file(str(url), album_dir / f"{index:02d}. {title}{suffix}"))
+            extra = self._download_extra(str(url), album_dir, f"{index:02d}. {title}{safe_filename(suffix)[:20]}")
+            if extra:
+                written.append(extra)
         return written
+
+    def _download_extra(self, url: str, directory: Path, filename: str) -> Path | None:
+        destination = self._contained_path(directory, directory / filename)
+        try:
+            if destination.is_file() and destination.stat().st_size > 0:
+                return destination
+            return self.download_url_file(url, destination)
+        except Exception as exc:
+            LOGGER.warning("Could not download optional extra %s: %s", destination, type(exc).__name__)
+            return None
 
     def download_artist_poster(self, source: Any, artist_dir: Path) -> Path | None:
         """Save the artist poster/image in the artist folder when Qobuz metadata exposes one."""
         if not isinstance(source, dict):
             return None
+        for path in sorted(artist_dir.glob("artist-poster.*")):
+            self._contained_path(artist_dir, path)
+            if path.is_file() and path.stat().st_size > 0:
+                return path
         artist = self._artist_dict(source)
         artist_payload = artist
         artist_id = artist.get("id") or artist.get("artist_id")
@@ -386,12 +472,12 @@ class QobuzClient:
                 if isinstance(fetched_artist, dict):
                     artist_payload = {**artist, **fetched_artist}
             except Exception as exc:  # pragma: no cover - poster is best-effort and must not break sync
-                LOGGER.debug("Could not fetch Qobuz artist poster metadata for %s: %s", artist_id, exc)
+                LOGGER.debug("Could not fetch Qobuz artist poster metadata for %s: %s", artist_id, type(exc).__name__)
         poster_url = self._image_url(artist_payload)
         if not poster_url:
             return None
         suffix = Path(str(poster_url).split("?", 1)[0]).suffix or ".jpg"
-        return self.download_url_file(str(poster_url), artist_dir / f"artist-poster{suffix}")
+        return self._download_extra(str(poster_url), artist_dir, f"artist-poster{safe_filename(suffix)}")
 
 
     def embed_track_metadata(
@@ -404,15 +490,16 @@ class QobuzClient:
         track_number: int | None = None,
         track_total: int | None = None,
     ) -> None:
-        """Embed basic Vorbis comments and cover art into a downloaded FLAC file."""
+        """Embed FLAC/ID3 tags, avoiding writes when metadata and art already match."""
         try:
             from mutagen.flac import FLAC, Picture
+            from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK
         except Exception as exc:  # pragma: no cover - dependency/import environment issue
-            LOGGER.warning("Skipping FLAC metadata embedding because mutagen is unavailable: %s", exc)
+            LOGGER.warning("Skipping metadata embedding because mutagen is unavailable: %s", type(exc).__name__)
             return
 
         try:
-            audio = FLAC(path)
+            path = Path(path)
             album_dict = album if isinstance(album, dict) else {}
             performer = track.get("performer", {}).get("name") if isinstance(track.get("performer"), dict) else None
             album_artist = album_dict.get("artist", {}).get("name") if isinstance(album_dict.get("artist"), dict) else None
@@ -420,30 +507,79 @@ class QobuzClient:
             title = track.get("title") or track.get("name")
             album_title = album_dict.get("title") or album_dict.get("name")
             release_date = album_dict.get("release_date_original") or album_dict.get("released_at") or album_dict.get("release_date_download")
-            if title:
-                audio["TITLE"] = str(title)
-            if artist:
-                audio["ARTIST"] = str(artist)
-            if album_title:
-                audio["ALBUM"] = str(album_title)
-            if release_date:
-                audio["DATE"] = str(release_date)[:10]
+            if isinstance(release_date, (int, float)):
+                release_date = datetime.fromtimestamp(release_date, timezone.utc).date().isoformat()
             number = track_number or track.get("track_number") or track.get("number")
-            if number:
-                audio["TRACKNUMBER"] = str(number)
-            if track_total:
-                audio["TRACKTOTAL"] = str(track_total)
-            if cover_path and cover_path.exists():
+            disc = track.get("media_number") or track.get("disc_number")
+            cover_data = cover_path.read_bytes() if cover_path and cover_path.is_file() else None
+            mime = "image/jpeg" if cover_path and cover_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+            changed = False
+            if path.suffix.lower() == ".mp3":
+                try:
+                    audio = ID3(path)
+                except ID3NoHeaderError:
+                    audio = ID3()
+                values = [
+                    (TIT2, title), (TPE1, artist), (TPE2, album_artist), (TALB, album_title),
+                    (TDRC, str(release_date)[:10] if release_date else None),
+                    (TRCK, f"{number}/{track_total}" if number and track_total else number),
+                    (TPOS, disc),
+                ]
+                for frame, value in values:
+                    if value and str(audio.get(frame.__name__, "")) != str(value):
+                        audio.add(frame(encoding=3, text=[str(value)]))
+                        changed = True
+                if cover_data and not any(p.type == 3 and p.data == cover_data and p.mime == mime for p in audio.getall("APIC")):
+                    audio.delall("APIC")
+                    audio.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover_data))
+                    changed = True
+                if changed:
+                    self._save_metadata(audio, path)
+                return
+            if path.suffix.lower() != ".flac":
+                return
+            audio = FLAC(path)
+            values = {
+                "TITLE": title, "ARTIST": artist, "ALBUMARTIST": album_artist, "ALBUM": album_title,
+                "DATE": str(release_date)[:10] if release_date else None,
+                "TRACKNUMBER": number, "TRACKTOTAL": track_total, "DISCNUMBER": disc,
+            }
+            for key, value in values.items():
+                if value and audio.get(key) != [str(value)]:
+                    audio[key] = str(value)
+                    changed = True
+            if cover_data and not any(p.type == 3 and p.data == cover_data and p.mime == mime for p in audio.pictures):
                 picture = Picture()
                 picture.type = 3
-                picture.mime = "image/jpeg" if cover_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+                picture.mime = mime
                 picture.desc = "Cover"
-                picture.data = cover_path.read_bytes()
+                picture.data = cover_data
                 audio.clear_pictures()
                 audio.add_picture(picture)
-            audio.save()
+                changed = True
+            if changed:
+                self._save_metadata(audio, path)
         except Exception as exc:  # pragma: no cover - corrupted/unsupported files should not break sync
-            LOGGER.warning("Could not embed metadata into %s: %s", path, exc)
+            LOGGER.warning("Could not embed metadata into %s: %s", path, type(exc).__name__)
+
+    @staticmethod
+    def _save_metadata(audio: Any, path: Path) -> None:
+        """Mutagen can modify a file before raising; only ever save into a sibling copy."""
+        temporary: Path | None = None
+        try:
+            with path.open("rb") as source, tempfile.NamedTemporaryFile(mode="w+b", dir=path.parent, prefix=".qobuz-tags-", suffix=".part", delete=False) as handle:
+                temporary = Path(handle.name)
+                shutil.copyfileobj(source, handle)
+                handle.flush()
+                handle.seek(0)
+                audio.save(handle)
+                handle.flush()
+                os.fchmod(handle.fileno(), os.fstat(source.fileno()).st_mode & 0o777)
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _first_cover(paths: list[Path]) -> Path | None:
@@ -487,40 +623,75 @@ class QobuzClient:
         for choosing a safe path after reading track/album metadata.
         """
         url = self.get_track_file_url(track_id, quality)
+        return self._download_file(url, destination, progress_callback=progress_callback, expected_format="mp3" if quality == 5 else "flac")
+
+    def download_url_file(self, url: str, destination: Path) -> Path:
+        return self._download_file(url, destination)
+
+    def _download_file(self, url: str, destination: Path, *, progress_callback: Callable[[int, int], None] | None = None, expected_format: Literal["flac", "mp3"] | None = None) -> Path:
+        destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary: Path | None = None
         try:
-            with self.session.get(url, stream=True, timeout=self.timeout) as response:  # type: ignore[attr-defined]
+            # None removes session Qobuz headers before media requests and their redirects.
+            headers = {"X-User-Auth-Token": None, "X-App-Id": None, "Authorization": None, "Accept-Encoding": "identity"}
+            with self.session.get(url, stream=True, timeout=self.timeout, headers=headers) as response:
                 response.raise_for_status()
-                total = int(response.headers.get("content-length") or 0)
+                if getattr(response, "status_code", 200) == 206 or "content-range" in response.headers:
+                    raise QobuzError("Unexpected partial media response")
+                if response.headers.get("content-encoding", "identity").lower() != "identity":
+                    raise QobuzError("Unexpected content encoding for media download")
+                length = response.headers.get("content-length")
+                try:
+                    total = int(length) if length is not None else 0
+                    if total < 0:
+                        raise ValueError("negative length")
+                except (TypeError, ValueError) as exc:
+                    raise QobuzError("Invalid media Content-Length") from exc
                 downloaded = 0
-                with destination.open("wb") as handle:
+                with tempfile.NamedTemporaryFile(mode="wb", dir=destination.parent, prefix=".qobuz-", suffix=".part", delete=False) as handle:
+                    temporary = Path(handle.name)
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             handle.write(chunk)
                             downloaded += len(chunk)
                             if progress_callback:
                                 progress_callback(downloaded, total)
-        except Exception:
-            destination.unlink(missing_ok=True)
-            raise
-        return destination
-
-    def download_url_file(self, url: str, destination: Path) -> Path:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with self.session.get(url, stream=True, timeout=self.timeout) as response:  # type: ignore[attr-defined]
-                response.raise_for_status()
-                with destination.open("wb") as handle:
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            handle.write(chunk)
-        except Exception:
-            destination.unlink(missing_ok=True)
-            raise
+                    if downloaded == 0 or (length is not None and downloaded != total):
+                        raise QobuzError(f"Incomplete media download: received {downloaded} bytes, expected {length or 'nonzero'}")
+                    handle.flush()
+                    # Keep existing archive permissions; new media must also be readable by library services.
+                    os.fchmod(handle.fileno(), destination.stat().st_mode & 0o777 if destination.exists() else 0o644)
+                    os.fsync(handle.fileno())
+            if expected_format:
+                # Basic format identification only, not a full audio decode or integrity check.
+                with temporary.open("rb") as handle:
+                    signature = handle.read(4)
+                if expected_format == "flac":
+                    valid = signature == b"fLaC"
+                else:
+                    valid = len(signature) == 4 and (
+                        signature.startswith(b"ID3") or (
+                            signature[0] == 0xFF and signature[1] & 0xE0 == 0xE0
+                            and signature[1] & 0x06 == 0x02 and signature[1] & 0x18 != 0x08
+                            and signature[2] & 0xF0 != 0xF0 and signature[2] & 0x0C != 0x0C
+                        )
+                    )
+                if not valid:
+                    raise QobuzError(f"Downloaded audio does not have the expected {expected_format.upper()} signature")
+            # Only publish after the stream and response have both closed successfully.
+            temporary.replace(destination)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         return destination
 
     def _get(self, endpoint: str, **params: Any) -> dict[str, Any]:
-        response = self.session.get(f"{self.base_url}/{endpoint}", params=params, timeout=self.timeout)
+        headers = {"X-App-Id": self.app_id, "X-User-Auth-Token": self.user_auth_token}
+        response = self.session.get(f"{self.base_url}/{endpoint}", params=params, timeout=self.timeout, headers=headers, allow_redirects=False)
+        if 300 <= getattr(response, "status_code", 200) < 400:
+            response.close()
+            raise QobuzError(f"Refusing redirect from Qobuz API endpoint {endpoint}")
         if endpoint == "user/login" and getattr(response, "status_code", 200) == 401:
             raise AuthenticationError("Invalid Qobuz credentials")
         response.raise_for_status()
@@ -532,6 +703,44 @@ class QobuzClient:
     def _require_login(self) -> None:
         if not self.user_auth_token:
             raise AuthenticationError("Qobuz client is not logged in")
+
+    @staticmethod
+    def _safe_id(value: Any) -> str:
+        value = str(value) if value is not None else ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", value) or value == "None":
+            raise QobuzError("Invalid Qobuz item ID")
+        return value
+
+    @staticmethod
+    def _contained_path(root: Path, path: Path) -> Path:
+        if not path.resolve().is_relative_to(root.resolve()):
+            raise QobuzError(f"Download path escapes output directory: {path}")
+        return path
+
+    def _album_directory(self, root: Path, artist_dir: Path, title: str, album_id: Any) -> Path:
+        directory = self._contained_path(root, artist_dir / safe_filename(title))
+        if album_id is None:
+            return directory
+        album_id = self._safe_id(album_id)
+        # Reuse known archives, but never claim nonempty folders with unknown ownership.
+        alternate = self._contained_path(root, artist_dir / f"{safe_filename(title)} [{album_id}]")
+        alternate_marker = self._contained_path(root, alternate / ".qobuz-album-id")
+        if alternate_marker.is_file() and alternate_marker.read_text(encoding="ascii").strip() == album_id:
+            return alternate
+        for candidate in (directory, alternate):
+            self._contained_path(root, candidate)
+            marker = self._contained_path(root, candidate / ".qobuz-album-id")
+            candidate.mkdir(parents=True, exist_ok=True)
+            if not marker.exists() and any(candidate.iterdir()):
+                continue
+            try:
+                with marker.open("x", encoding="ascii") as handle:
+                    handle.write(album_id)
+                return candidate
+            except FileExistsError:
+                if marker.read_text(encoding="ascii").strip() == album_id:
+                    return candidate
+        raise QobuzError(f"Album directory is already owned by another album: {album_id}")
 
     @staticmethod
     def _album_title(album: dict[str, Any]) -> str:
@@ -568,4 +777,5 @@ class QobuzClient:
 def safe_filename(value: str) -> str:
     cleaned = re.sub(r'[^A-Za-z0-9._() \-\[\]]+', '_', value).strip()
     cleaned = re.sub(r'\s+', ' ', cleaned)
-    return (cleaned or 'untitled')[:160]
+    cleaned = cleaned[:160].rstrip()
+    return cleaned if cleaned.strip(".") else 'untitled'

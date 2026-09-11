@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import mimetypes
 import os
 import threading
-import time
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -14,15 +15,16 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from .state import AppConfig, DEFAULT_DOWNLOAD_DIR, SyncState
-from .sync import SyncService
+from .sync import SyncService, _safe_message
 
 
 SYNC_JOB_LOCK = threading.Lock()
 AUTH_COOKIE_NAME = "qobuz_sync_session"
-_QOBUZ_CLIENT_CACHE: tuple[float, object | None] | None = None
-_ART_RECOVERY_CACHE: dict[str, float] = {}
-_ART_RECOVERY_LOCK = threading.Lock()
-_ART_RECOVERY_TTL_SECONDS = 3600
+LOGGER = logging.getLogger(__name__)
+
+
+def session_token(token: str) -> str:
+    return hmac.new(token.encode("utf-8"), b"qobuz-sync-session", "sha256").hexdigest()
 
 
 def auth_token() -> str:
@@ -45,6 +47,11 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         worker: threading.Thread | None = None
+        progress = state.latest_progress()
+        if progress and progress["phase"] not in {"complete", "error", "idle"} and not SYNC_JOB_LOCK.locked():
+            state.set_progress(phase="error", message="Previous sync was interrupted. Run Sync now to resume.")
+            state.clear_track_progress()
+            state.record_sync(success=False, found=0, downloaded=0, message="Previous sync was interrupted")
         if os.environ.get("QOBUZ_SYNC_BACKGROUND", "0") == "1":
             worker = threading.Thread(target=run_background_sync, args=(state, stop_event), daemon=True)
             worker.start()
@@ -63,26 +70,43 @@ def create_app() -> FastAPI:
             origin = request.headers.get("origin", "")
             if origin:
                 try:
-                    origin_host = urlparse(origin).hostname or ""
+                    parsed = urlparse(origin)
+                    default_port = lambda scheme: 443 if scheme == "https" else 80
+                    same_origin = (
+                        parsed.scheme in {"http", "https"}
+                        and parsed.scheme == request.url.scheme
+                        and parsed.hostname == request.url.hostname
+                        and (parsed.port or default_port(parsed.scheme)) == (request.url.port or default_port(request.url.scheme))
+                        and not parsed.username and not parsed.password
+                        and parsed.path in {"", "/"} and not parsed.query and not parsed.fragment
+                    )
                 except ValueError:
-                    origin_host = ""
-                request_host = (request.headers.get("host", "") or "").split(":")[0]
-                if origin_host and origin_host not in {request_host, request.url.hostname}:
+                    same_origin = False
+                if not same_origin:
                     return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
+            elif request.headers.get("sec-fetch-site") == "cross-site":
+                return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
         if request.url.path in {"/health", "/login"}:
             return await call_next(request)
         configured_token = auth_token()
         if configured_token:
+            expected = configured_token
             provided = (request.headers.get("authorization", "") or "").removeprefix("Bearer ").strip()
             if not provided:
                 provided = request.headers.get("x-api-key", "")
             if not provided:
                 provided = request.cookies.get(AUTH_COOKIE_NAME, "")
-            if not (provided and hmac.compare_digest(provided, configured_token)):
+                expected = session_token(configured_token)
+            if not (provided and hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))):
                 if "text/html" in request.headers.get("accept", ""):
                     return RedirectResponse("/login", status_code=303)
                 return JSONResponse({"detail": "Authentication required"}, status_code=401)
-        return await call_next(request)
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        if request.url.path.startswith(("/art/", "/progress-art/")):
+            response.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -93,12 +117,12 @@ def create_app() -> FastAPI:
         return render_login()
 
     @app.post("/login")
-    def login_submit(token: str = Form("")) -> Response:
+    def login_submit(request: Request, token: str = Form("")) -> Response:
         configured_token = auth_token()
-        if not configured_token or not (token and hmac.compare_digest(token.strip(), configured_token)):
+        if not configured_token or not (token and hmac.compare_digest(token.strip().encode("utf-8"), configured_token.encode("utf-8"))):
             return HTMLResponse(render_login(error="Incorrect access token"), status_code=401)
         response = RedirectResponse("/", status_code=303)
-        response.set_cookie(AUTH_COOKIE_NAME, configured_token, httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
+        response.set_cookie(AUTH_COOKIE_NAME, session_token(configured_token), secure=request.url.scheme == "https", httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
         return response
 
     @app.post("/logout")
@@ -137,8 +161,6 @@ def create_app() -> FastAPI:
                 data, media_type = embedded
                 return Response(data, media_type=media_type)
         if art is None:
-            art = cached_recover_cover(state, kind, purchase_id, download_path)
-        if art is None:
             title = download_title(state, kind, purchase_id)
             return Response(fallback_cover_svg(title or purchase_id, kind), media_type="image/svg+xml")
         return FileResponse(art, media_type=mimetypes.guess_type(art.name)[0] or "image/jpeg")
@@ -169,7 +191,8 @@ def create_app() -> FastAPI:
         latest = state.latest_sync()
         progress = state.latest_progress()
         total = state.count_downloads()
-        status = "All Good!" if latest and latest.get("success") else (progress or {}).get("message") or "Not synced yet"
+        status = (progress or {}).get("message") if SYNC_JOB_LOCK.locked() else None
+        status = status or ("All Good!" if latest and latest.get("success") else (progress or {}).get("message") or "Not synced yet")
         return {
             "text": str(status),
             "items": [
@@ -185,16 +208,26 @@ def create_app() -> FastAPI:
         qobuz_user_id: str = Form(""),
         qobuz_user_auth_token: str = Form(""),
         quality: int = Form(6),
-        interval_minutes: int = Form(60),
+        interval_minutes: int = Form(60, ge=5, le=10080),
         embed_art: str | None = Form(None),
         include_albums: str | None = Form(None),
         include_tracks: str | None = Form(None),
     ) -> RedirectResponse:
+        if quality not in {5, 6, 7, 27}:
+            raise HTTPException(status_code=422, detail="Unsupported audio quality")
         current = state.load_config()
         pasted_user_id, pasted_auth_token, pasted_email = parse_qobuz_localuser(qobuz_localuser)
-        email = pasted_email or current.qobuz_email
-        user_id = qobuz_user_id.strip() or pasted_user_id or current.qobuz_user_id
-        auth_token = qobuz_user_auth_token.strip() or pasted_auth_token or current.qobuz_user_auth_token
+        if qobuz_localuser.strip():
+            if not (pasted_user_id and pasted_auth_token):
+                raise HTTPException(status_code=422, detail="Paste a valid Qobuz browser session containing user ID and token")
+            user_id, auth_token = pasted_user_id, pasted_auth_token
+            email = pasted_email
+        else:
+            user_id = qobuz_user_id.strip() or current.qobuz_user_id
+            auth_token = qobuz_user_auth_token.strip() or current.qobuz_user_auth_token
+            if user_id != current.qobuz_user_id and not qobuz_user_auth_token.strip():
+                raise HTTPException(status_code=422, detail="Enter the token for the new user ID")
+            email = current.qobuz_email if user_id == current.qobuz_user_id else ""
         state.save_config(
             AppConfig(
                 qobuz_email=email,
@@ -210,11 +243,10 @@ def create_app() -> FastAPI:
         )
         return RedirectResponse("/", status_code=303)
 
-    @app.post("/sync-now")
-    def sync_now(request: Request):
+    def start_job(request: Request, *, resync: bool = False):
         def run_sync() -> None:
             try:
-                SyncService(state).sync_once()
+                run_sync_job(state, resync=resync)
             finally:
                 SYNC_JOB_LOCK.release()
 
@@ -222,27 +254,22 @@ def create_app() -> FastAPI:
             if "application/json" in request.headers.get("accept", ""):
                 return JSONResponse({"started": False, "message": "A sync is already running"}, status_code=409)
             return RedirectResponse("/", status_code=303)
-        threading.Thread(target=run_sync, daemon=True).start()
+        try:
+            threading.Thread(target=run_sync, daemon=True).start()
+        except Exception:
+            SYNC_JOB_LOCK.release()
+            return JSONResponse({"started": False, "message": "Could not start sync; please retry"}, status_code=503)
         if "application/json" in request.headers.get("accept", ""):
-            return {"started": True, "message": "Sync started"}
+            return {"started": True, "message": "Full library re-sync started" if resync else "Sync started"}
         return RedirectResponse("/", status_code=303)
+
+    @app.post("/sync-now")
+    def sync_now(request: Request):
+        return start_job(request)
 
     @app.post("/resync-all")
     def resync_all(request: Request):
-        def run_resync() -> None:
-            try:
-                SyncService(state).resync_entire_library()
-            finally:
-                SYNC_JOB_LOCK.release()
-
-        if not SYNC_JOB_LOCK.acquire(blocking=False):
-            if "application/json" in request.headers.get("accept", ""):
-                return JSONResponse({"started": False, "message": "A sync is already running"}, status_code=409)
-            return RedirectResponse("/", status_code=303)
-        threading.Thread(target=run_resync, daemon=True).start()
-        if "application/json" in request.headers.get("accept", ""):
-            return {"started": True, "message": "Full library re-sync started"}
-        return RedirectResponse("/", status_code=303)
+        return start_job(request, resync=True)
 
     return app
 
@@ -268,7 +295,28 @@ def parse_qobuz_localuser(raw_value: str) -> tuple[str, str, str]:
     user_id = payload.get("id") or payload.get("user_id") or user.get("id")
     token = payload.get("token") or payload.get("user_auth_token")
     email = payload.get("email") or payload.get("login") or user.get("email") or user.get("login")
+    if isinstance(user_id, bool) or not isinstance(user_id, (str, int)) or not isinstance(token, str):
+        return "", "", ""
+    if not isinstance(email, str):
+        email = ""
     return str(user_id or "").strip(), str(token or "").strip(), str(email or "").strip()
+
+
+def run_sync_job(state: SyncState, *, resync: bool = False) -> None:
+    try:
+        service = SyncService(state)
+        if resync:
+            service.resync_entire_library()
+        else:
+            service.sync_once()
+    except Exception as exc:
+        LOGGER.error("Sync job failed: %s", _safe_message(exc))
+        try:
+            state.set_progress(phase="error", message="Sync failed; please retry and check the service logs")
+            state.clear_track_progress()
+            state.record_sync(success=False, found=0, downloaded=0, message="Sync failed; please retry and check the service logs")
+        except Exception:
+            LOGGER.error("Could not persist sync failure status")
 
 
 def run_background_sync(state: SyncState, stop_event: threading.Event) -> None:
@@ -276,10 +324,17 @@ def run_background_sync(state: SyncState, stop_event: threading.Event) -> None:
     # Delay first run a little so the web UI becomes reachable immediately after container start.
     stop_event.wait(10)
     while not stop_event.is_set():
-        config = state.load_config()
-        if config.is_configured:
-            SyncService(state).sync_once()
-        interval_seconds = max(5, state.load_config().interval_minutes * 60)
+        interval_seconds = 300
+        try:
+            config = state.load_config()
+            interval_seconds = max(300, min(604800, config.interval_minutes * 60))
+            if config.is_configured and SYNC_JOB_LOCK.acquire(blocking=False):
+                try:
+                    run_sync_job(state)
+                finally:
+                    SYNC_JOB_LOCK.release()
+        except Exception as exc:
+            LOGGER.error("Scheduled sync failed: %s", _safe_message(exc))
         stop_event.wait(interval_seconds)
 
 
@@ -295,22 +350,18 @@ def render_home(
     configured = "Configured" if config.is_configured else "Not configured"
     status_class = "ready" if config.is_configured else "needs-setup"
     latest_time = "Never synced"
-    latest_status = "Not synced yet."
     latest_class = "muted"
     found = "—"
     downloaded = escape(total_downloads if total_downloads is not None else len(downloads))
     if latest:
-        ok = "Successful" if latest["success"] else "Failed"
         latest_class = "success" if latest["success"] else "error"
         latest_time = escape(latest["finished_at"])
-        latest_status = "All Good!" if latest["success"] else f"{ok}: {escape(latest['message'])}"
         found = escape(latest["found"])
         if total_downloads is None:
             downloaded = escape(latest["downloaded"])
     recent_downloads = downloads[:20]
     track_progress_rows = track_progress or []
     download_rows = render_download_rows(recent_downloads, track_progress=track_progress_rows)
-    track_progress_rows = track_progress or []
     progress_label = progress_text(progress)
     progress_message = escape((progress or {}).get("message", "Idle"))
     progress_phase = escape(str((progress or {}).get("phase", "idle")).replace("_", " ").title())
@@ -319,7 +370,7 @@ def render_home(
     progress_percent = 100 if (progress or {}).get("phase") == "complete" else 0
     if progress_total:
         progress_percent = max(0, min(100, round((progress_current / progress_total) * 100)))
-    sync_badge = latest_status if latest else "Waiting"
+    sync_badge = ("All Good!" if latest["success"] else "Needs attention") if latest else "Waiting"
     token_note = "Saved token is stored; enter a new token to replace it." if config.qobuz_user_auth_token else "Required with Qobuz user ID."
     localuser_note = "Paste the full localuser value from Qobuz Web Player to fill user ID and token automatically."
     # Render a static HTML template with escaped dynamic values; this is not a SQL query.
@@ -438,7 +489,7 @@ def render_home(
     .needs-setup {{ color: var(--accent); background: rgba(245, 158, 11, .13); }}
     .stat {{ padding: .68rem .78rem; border-radius: 18px; background: rgba(255, 255, 255, .07); background-clip: padding-box; border: 1px solid rgba(255,255,255,.12); box-shadow: var(--glass-inset); overflow: hidden; isolation: isolate; clip-path: inset(0 round 18px); }}
     .stat small {{ display: block; color: var(--muted); text-transform: uppercase; letter-spacing: .12em; font-size: .61rem; font-weight: 800; }}
-    .stat strong {{ display: block; margin-top: .18rem; font-size: 1.05rem; }}
+    .stat strong {{ display: block; margin-top: .18rem; font-size: 1.05rem; overflow-wrap: anywhere; }}
     .tabs {{ margin-bottom: 1rem; }}
     .tab-input {{ position: absolute; inline-size: 1px; block-size: 1px; opacity: 0; pointer-events: none; }}
     .tab-list {{
@@ -474,6 +525,11 @@ def render_home(
       box-shadow: 0 12px 30px rgba(245, 158, 11, .22);
     }}
     .tab-panel {{ display: none; }}
+    #tab-library:focus-visible ~ .tab-list label[for="tab-library"],
+    #tab-settings:focus-visible ~ .tab-list label[for="tab-settings"] {{ outline: 2px solid white; outline-offset: -4px; }}
+    button:focus-visible {{ outline: 2px solid white; outline-offset: -4px; }}
+    button:disabled {{ opacity: .6; cursor: wait; }}
+    #action-feedback {{ margin: .65rem 0 0; overflow-wrap: anywhere; }}
     #tab-library:checked ~ .tab-panels #library-panel,
     #tab-settings:checked ~ .tab-panels #settings-panel {{ display: block; }}
     .grid {{ display: grid; grid-template-columns: .95fr 1.05fr; gap: 1rem; align-items: start; }}
@@ -538,7 +594,7 @@ def render_home(
     .sync-badge.success {{ color: var(--green); background: rgba(52, 211, 153, .12); }}
     .sync-badge.error {{ color: var(--red); background: rgba(251, 113, 133, .12); }}
     .sync-badge.muted {{ color: var(--accent); background: rgba(245, 158, 11, .12); }}
-    .sync-message {{ margin: 0 0 .85rem; color: var(--text); font-weight: 850; font-size: 1.05rem; }}
+    .sync-message {{ margin: 0 0 .85rem; color: var(--text); font-weight: 850; font-size: 1.05rem; overflow-wrap: anywhere; }}
     .progress-meter {{ width: 100%; height: .7rem; overflow: hidden; border-radius: 999px; background: rgba(5, 7, 12, .7); border: 1px solid rgba(255,255,255,.08); background-clip: padding-box; clip-path: inset(0 round 999px); transform: translateZ(0); }}
     .progress-fill {{ height: 100%; border-radius: inherit; background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: 0 0 22px rgba(245, 158, 11, .38); transition: width .25s ease; }}
     .sync-detail-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .6rem; margin-top: .85rem; }}
@@ -577,6 +633,8 @@ def render_home(
     .path {{ color: #cbd5e1; word-break: break-all; }}
     .empty {{ text-align: center; color: var(--muted); border-radius: 16px !important; }}
     @media (max-width: 860px) {{ .hero, .grid, .field-grid, .status-panel {{ grid-template-columns: 1fr; }} .checks {{ grid-template-columns: 1fr; }} .tab-list {{ display: flex; width: 100%; }} .tab-list label {{ flex: 1; text-align: center; }} .download-card {{ grid-template-columns: 4.25rem minmax(0, 1fr); }} .cover-wrap {{ width: 4.25rem; height: 4.25rem; }} }}
+    @media (max-width: 480px) {{ .sync-head {{ flex-wrap: wrap; }} .sync-detail-grid {{ grid-template-columns: 1fr; }} .tab-list label {{ padding: .7rem .55rem; }} .section-head {{ flex-wrap: wrap; }} }}
+    @media (prefers-reduced-motion: reduce) {{ *, *::before, *::after {{ transition: none !important; }} }}
   </style>
 </head>
 <body>
@@ -590,8 +648,9 @@ def render_home(
         <p>Monitor purchased albums and tracks, sync them to your Umbrel Downloads/QobuzSync folder, and keep artwork, and metadata in one place for Navidrome or your preferred music server to digest.</p>
         <div class="hero-actions">
           <form id="sync-now-form" class="sync-form" method="post" action="/sync-now"><button id="sync-now-button" type="submit">Sync now</button><span id="sync-now-check" class="sync-check" aria-live="polite" aria-label="Sync started">✓</span></form>
-          <form id="resync-all-form" class="sync-form" method="post" action="/resync-all"><button id="resync-all-button" class="danger-button" type="submit">Re Sync Entire Library</button><span id="resync-all-check" class="sync-check" aria-live="polite" aria-label="Entire library re-synced">✓</span></form>
+          <form id="resync-all-form" class="sync-form" method="post" action="/resync-all"><button id="resync-all-button" class="danger-button" type="submit">Re Sync Entire Library</button><span id="resync-all-check" class="sync-check" aria-label="Library re-sync started">✓</span></form>
         </div>
+        <p id="action-feedback" role="status" aria-live="polite"></p>
       </div>
     </div>
     <aside class="status-panel hero-card">
@@ -605,18 +664,18 @@ def render_home(
   <div class="tabs">
     <input class="tab-input" type="radio" name="tabs" id="tab-library" checked>
     <input class="tab-input" type="radio" name="tabs" id="tab-settings">
-    <div class="tab-list" role="tablist" aria-label="Qobuz Sync sections">
-      <label role="tab" for="tab-library">Library</label>
-      <label role="tab" for="tab-settings">Settings &amp; status</label>
+    <div class="tab-list" role="group" aria-label="Qobuz Sync sections">
+      <label for="tab-library">Library</label>
+      <label for="tab-settings">Settings &amp; status</label>
     </div>
 
     <div class="tab-panels">
-      <section id="library-panel" class="tab-panel" role="tabpanel">
+      <section id="library-panel" class="tab-panel" aria-label="Library">
         <div class="section-head"><h2>Recent downloads</h2><span>Latest 20 Tracks, Scroll Down To See More</span></div>
         <div id="downloads-grid" class="downloads-grid">{download_rows}</div>
       </section>
 
-      <div id="settings-panel" class="tab-panel" role="tabpanel">
+      <div id="settings-panel" class="tab-panel" role="region" aria-label="Settings and status">
         <div class="grid">
           <section>
             <h2>Settings</h2>
@@ -633,7 +692,7 @@ def render_home(
                     {quality_option(config.quality, 27, 'Hi-Res 24-bit / >96 kHz')}
                   </select></span>
                 </label>
-                <label><span>Sync interval minutes</span><input name="interval_minutes" type="number" min="5" value="{config.interval_minutes}"></label>
+                <label><span>Sync interval minutes</span><input name="interval_minutes" type="number" min="5" max="10080" value="{config.interval_minutes}"></label>
               </div>
               <div class="checks">
                 <label><input name="include_albums" type="checkbox" {'checked' if config.include_albums else ''}> Albums</label>
@@ -652,7 +711,7 @@ def render_home(
                 <span id="sync-status-badge" class="sync-badge {latest_class}">{sync_badge}</span>
               </div>
               <p id="sync-progress-message" class="sync-message">{progress_message}</p>
-              <div class="progress-meter" aria-label="Master downloads progress"><div id="master-downloads-progress-fill" class="progress-fill" style="width: {progress_percent}%"></div></div>
+              <div class="progress-meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{progress_percent}" aria-label="Master downloads progress"><div id="master-downloads-progress-fill" class="progress-fill" style="width: {progress_percent}%"></div></div>
               <div class="sync-detail-grid">
                 <div id="progress-phase" class="sync-detail"><small>Phase</small><strong>{progress_phase}</strong></div>
                 <div id="progress-label" class="sync-detail"><small>Progress</small><strong>{escape(progress_label)}</strong></div>
@@ -682,10 +741,14 @@ def render_home(
   const resyncForm = document.getElementById('resync-all-form');
   const resyncButton = document.getElementById('resync-all-button');
   const resyncCheck = document.getElementById('resync-all-check');
-  let syncCheckTimer;
-  let resyncCheckTimer;
-  let progressPollTimer;
+  const feedback = document.getElementById('action-feedback');
+  let checkTimer;
   let liveRefreshTimer;
+  let refreshInFlight = false;
+  let submitting = false;
+  let jobBusy = false;
+  let authExpired = false;
+  let lastDownloadsHtml = document.getElementById('downloads-grid')?.innerHTML;
   const ACTIVE_REFRESH_MS = 2000;
   const IDLE_REFRESH_MS = 8000;
 
@@ -700,8 +763,8 @@ def render_home(
   }}
 
   function syncBadgeClass(latestSync) {{
-    if (!latestSync) return 'sync-badge';
-    return `sync-badge ${{latestSync.success ? 'ok' : 'error'}}`;
+    if (!latestSync) return 'sync-badge muted';
+    return `sync-badge ${{latestSync.success ? 'success' : 'error'}}`;
   }}
 
   function progressLabel(progress) {{
@@ -712,9 +775,16 @@ def render_home(
   }}
 
   async function refreshProgressOnce() {{
-    const response = await fetch('/api/progress', {{ headers: {{ 'Accept': 'application/json' }} }});
+    const response = await fetch('/api/progress', {{ headers: {{ 'Accept': 'application/json' }}, signal: AbortSignal.timeout(10000) }});
+    if (response.status === 401) {{
+      authExpired = true;
+      throw new Error('Session expired. Reload the page to sign in.');
+    }}
     if (!response.ok) throw new Error(`Progress request failed: ${{response.status}}`);
     const payload = await response.json();
+    if (feedback.textContent === 'Live updates paused. Retrying shortly.') feedback.textContent = '';
+    jobBusy = Boolean(payload.busy);
+    updateButtons();
     const progress = payload.progress || {{ phase: 'idle', message: 'Idle', current: 0, total: 0 }};
     document.querySelector('#downloaded-stat strong')?.replaceChildren(String(payload.downloaded_total ?? 0));
     const latestFound = payload.latest_sync?.found ?? '—';
@@ -725,106 +795,92 @@ def render_home(
     const total = Number(progress.total || 0);
     const percent = total ? Math.max(0, Math.min(100, Math.round((current / total) * 100))) : (progress.phase === 'complete' ? 100 : 0);
     const masterFill = document.getElementById('master-downloads-progress-fill');
-    if (masterFill) masterFill.style.width = `${{percent}}%`;
+    if (masterFill) {{
+      masterFill.style.width = `${{percent}}%`;
+      masterFill.parentElement.setAttribute('aria-valuenow', String(percent));
+    }}
     document.querySelector('#progress-phase strong')?.replaceChildren(String(progress.phase || 'idle').replaceAll('_', ' ').replace(/\\b\\w/g, c => c.toUpperCase()));
     document.querySelector('#progress-label strong')?.replaceChildren(progressLabel(progress));
     const latestSync = payload.latest_sync || null;
     document.getElementById('last-sync-time')?.replaceChildren(formatLatestSync(latestSync));
     const badge = document.getElementById('sync-status-badge');
     if (badge) {{
-      badge.className = syncBadgeClass(latestSync);
-      badge.replaceChildren(syncBadgeText(latestSync));
+      badge.className = jobBusy ? 'sync-badge muted' : syncBadgeClass(latestSync);
+      badge.replaceChildren(jobBusy ? 'Syncing' : syncBadgeText(latestSync));
     }}
     const grid = document.getElementById('downloads-grid');
     // downloads_html is generated by render_download_rows(), which escapes every
     // dynamic value before returning the small fixed card template.
-    if (grid && typeof payload.downloads_html === 'string') grid.innerHTML = payload.downloads_html;
-    return progress.phase;
+    if (grid && typeof payload.downloads_html === 'string' && payload.downloads_html !== lastDownloadsHtml) {{
+      grid.innerHTML = payload.downloads_html;
+      lastDownloadsHtml = payload.downloads_html;
+    }}
+    return jobBusy;
   }}
 
-  function activePhase(phase) {{
-    return !['complete', 'error', 'idle'].includes(String(phase || 'idle'));
+  function updateButtons() {{
+    if (syncButton) syncButton.disabled = submitting || jobBusy || authExpired;
+    if (resyncButton) resyncButton.disabled = submitting || jobBusy || authExpired;
   }}
 
-  function startProgressPolling() {{
-    clearInterval(progressPollTimer);
-    refreshProgressOnce().catch(console.error);
-    progressPollTimer = setInterval(async () => {{
-      try {{
-        const phase = await refreshProgressOnce();
-        if (!activePhase(phase)) clearInterval(progressPollTimer);
-      }} catch (error) {{
-        console.error(error);
-      }}
-    }}, ACTIVE_REFRESH_MS);
-  }}
-
-  function startLiveRefresh() {{
+  function startLiveRefresh(delay = IDLE_REFRESH_MS) {{
     clearTimeout(liveRefreshTimer);
-    const tick = async () => {{
-      let delay = IDLE_REFRESH_MS;
+    if (document.hidden || authExpired || refreshInFlight) return;
+    liveRefreshTimer = setTimeout(async () => {{
+      refreshInFlight = true;
+      let nextDelay = IDLE_REFRESH_MS;
       try {{
-        const phase = await refreshProgressOnce();
-        delay = activePhase(phase) ? ACTIVE_REFRESH_MS : IDLE_REFRESH_MS;
+        nextDelay = await refreshProgressOnce() ? ACTIVE_REFRESH_MS : IDLE_REFRESH_MS;
       }} catch (error) {{
-        console.error(error);
+        feedback.textContent = authExpired ? error.message : 'Live updates paused. Retrying shortly.';
       }}
-      liveRefreshTimer = setTimeout(tick, delay);
-    }};
-    liveRefreshTimer = setTimeout(tick, IDLE_REFRESH_MS);
+      refreshInFlight = false;
+      updateButtons();
+      startLiveRefresh(nextDelay);
+    }}, delay);
   }}
 
-  syncForm?.addEventListener('submit', async (event) => {{
+  async function submitSync(event) {{
     event.preventDefault();
-    if (!syncButton || !syncCheck) return;
-    const originalLabel = syncButton.textContent;
-    syncButton.disabled = true;
-    syncButton.textContent = 'Syncing…';
+    if (submitting || jobBusy || authExpired) return;
+    const form = event.currentTarget;
+    const resync = form === resyncForm;
+    if (resync && !window.confirm('Redownload all selected purchases? Existing files are kept until each replacement succeeds.')) return;
+    submitting = true;
+    updateButtons();
+    feedback.textContent = 'Starting sync...';
     try {{
-      const response = await fetch(syncForm.action, {{
+      const response = await fetch(form.action, {{
         method: 'POST',
         headers: {{ 'Accept': 'application/json', 'X-Requested-With': 'fetch' }},
+        signal: AbortSignal.timeout(10000),
       }});
-      if (!response.ok) throw new Error(`Sync request failed: ${{response.status}}`);
-      startProgressPolling();
-      syncCheck.classList.add('visible');
-      clearTimeout(syncCheckTimer);
-      syncCheckTimer = setTimeout(() => syncCheck.classList.remove('visible'), 2000);
-    }} catch (error) {{
-      console.error(error);
-    }} finally {{
-      syncButton.disabled = false;
-      syncButton.textContent = originalLabel || 'Sync now';
-    }}
-  }});
-
-  resyncForm?.addEventListener('submit', async (event) => {{
-    event.preventDefault();
-    if (!resyncButton || !resyncCheck) return;
-    const originalLabel = resyncButton.textContent;
-    resyncButton.disabled = true;
-    resyncButton.textContent = 'Re Syncing…';
-    try {{
-      const response = await fetch(resyncForm.action, {{
-        method: 'POST',
-        headers: {{ 'Accept': 'application/json', 'X-Requested-With': 'fetch' }},
-      }});
-      if (!response.ok) throw new Error(`Re-sync request failed: ${{response.status}}`);
+      if (response.status === 401) {{
+        authExpired = true;
+        throw new Error('Session expired. Reload the page to sign in.');
+      }}
       const result = await response.json();
-      if (!result.started) throw new Error(result.message || 'Re-sync failed');
-      startProgressPolling();
-      resyncCheck.classList.add('visible');
-      clearTimeout(resyncCheckTimer);
-      resyncCheckTimer = setTimeout(() => resyncCheck.classList.remove('visible'), 2000);
+      if (response.status === 409) jobBusy = true;
+      if (!response.ok || !result.started) throw new Error(result.message || 'Could not start sync. Please retry.');
+      jobBusy = true;
+      feedback.textContent = result.message;
+      const check = resync ? resyncCheck : syncCheck;
+      check?.classList.add('visible');
+      clearTimeout(checkTimer);
+      checkTimer = setTimeout(() => check?.classList.remove('visible'), 2000);
     }} catch (error) {{
-      console.error(error);
+      feedback.textContent = error.message;
     }} finally {{
-      resyncButton.disabled = false;
-      resyncButton.textContent = originalLabel || 'Re Sync Entire Library';
+      submitting = false;
+      updateButtons();
+      startLiveRefresh(0);
     }}
-  }});
+  }}
 
-  startLiveRefresh();
+  syncForm?.addEventListener('submit', submitSync);
+  resyncForm?.addEventListener('submit', submitSync);
+  document.addEventListener('visibilitychange', () => startLiveRefresh(0));
+  startLiveRefresh(0);
 </script>
 </body>
 </html>
@@ -902,7 +958,7 @@ def render_track_card_progress(progress: object) -> str:
     return f"""
           <div class="track-card-progress">
             <div class="track-progress-caption"><span>{status}</span><span>{downloaded} / {total}</span></div>
-            <div class="track-progress-meter" aria-label="Track download progress"><div class="track-progress-fill" style="width: {percent}%"></div></div>
+            <div class="track-progress-meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{percent}" aria-label="Track download progress"><div class="track-progress-fill" style="width: {percent}%"></div></div>
           </div>
     """
 
@@ -930,18 +986,17 @@ def progress_percent_value(value: object) -> int:
 
 
 def enrich_downloads(downloads: list[dict], state: SyncState | None = None) -> list[dict[str, object]]:
-    client = logged_in_qobuz_client(state) if state else None
-    return [enrich_download(row, qobuz_client=client) for row in downloads]
+    # Dashboard requests must never wait on Qobuz; sync writes metadata locally.
+    return [enrich_download(row) for row in downloads]
 
 
-def enrich_download(row: dict, qobuz_client: object | None = None) -> dict[str, object]:
+def enrich_download(row: dict) -> dict[str, object]:
     path = Path(str(row.get("path") or ""))
     metadata = media_metadata(path)
-    if not metadata.get("artist") or not metadata.get("duration"):
-        remote_metadata = qobuz_download_metadata(qobuz_client, row)
-        metadata = {**remote_metadata, **{key: value for key, value in metadata.items() if value}}
     row_title = str(row.get("title") or "")
     parsed_artist, parsed_title = split_artist_title(row_title)
+    if row.get("kind") == "album":
+        metadata = {**metadata, "title": metadata.get("album") or parsed_title, "duration": ""}
     title = metadata.get("title") or parsed_title or row_title or "Untitled"
     artist = metadata.get("artist") or parsed_artist or "Unknown artist"
     album = metadata.get("album") or (parsed_title if row.get("kind") == "album" else "Single") or "Album"
@@ -960,11 +1015,20 @@ def media_metadata(path: Path) -> dict[str, str]:
     if flac is None:
         return {}
     try:
+        stat = flac.stat()
+    except OSError:
+        return {}
+    return dict(_cached_media_metadata(str(flac), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size))
+
+
+@lru_cache(maxsize=256)
+def _cached_media_metadata(path: str, mtime_ns: int, ctime_ns: int, size: int) -> dict[str, str]:
+    try:
         from mutagen import File as MutagenFile
     except Exception:
         return {}
     try:
-        audio = MutagenFile(flac)
+        audio = MutagenFile(path, easy=True)
     except Exception:
         return {}
     if audio is None:
@@ -978,63 +1042,6 @@ def media_metadata(path: Path) -> dict[str, str]:
         "album": first_tag(tags, "album"),
         "duration": duration,
     }
-
-
-def logged_in_qobuz_client(state: SyncState | None) -> object | None:
-    global _QOBUZ_CLIENT_CACHE
-    if state is None:
-        return None
-    config = state.load_config()
-    if not config.is_configured:
-        return None
-    now = time.monotonic()
-    cached = _QOBUZ_CLIENT_CACHE
-    if cached is not None and cached[0] > now - 60 and cached[1] is not None:
-        return cached[1]
-    try:
-        client = SyncService(state)._build_client()
-        client.login(
-            user_id=config.qobuz_user_id,
-            user_auth_token=config.qobuz_user_auth_token,
-        )
-    except Exception:
-        _QOBUZ_CLIENT_CACHE = (now, None)
-        return None
-    _QOBUZ_CLIENT_CACHE = (now, client)
-    return client
-
-
-def qobuz_download_metadata(client: object | None, row: dict) -> dict[str, str]:
-    if client is None:
-        return {}
-    kind = str(row.get("kind") or "")
-    purchase_id = str(row.get("purchase_id") or "")
-    if not purchase_id:
-        return {}
-    try:
-        if kind == "track":
-            track = client.get_track(purchase_id)  # type: ignore[attr-defined]
-            album = track.get("album") if isinstance(track.get("album"), dict) else {}
-            performer = track.get("performer", {}).get("name") if isinstance(track.get("performer"), dict) else ""
-            album_artist = album.get("artist", {}).get("name") if isinstance(album.get("artist"), dict) else ""
-            return {
-                "title": str(track.get("title") or track.get("name") or ""),
-                "artist": str(performer or album_artist or ""),
-                "album": str(album.get("title") or album.get("name") or ""),
-                "duration": format_duration(track.get("duration")),
-            }
-        if kind == "album":
-            album = client.get_album(purchase_id)  # type: ignore[attr-defined]
-            artist = album.get("artist", {}).get("name") if isinstance(album.get("artist"), dict) else ""
-            return {
-                "title": str(album.get("title") or album.get("name") or ""),
-                "artist": str(artist or ""),
-                "album": str(album.get("title") or album.get("name") or ""),
-                "duration": format_duration(album.get("duration")),
-            }
-    except Exception:
-        return {}
-    return {}
 
 
 def split_artist_title(value: str) -> tuple[str, str]:
@@ -1063,12 +1070,12 @@ def first_audio_for_path(path: Path) -> Path | None:
     if path.is_file():
         return path
     if path.is_dir():
-        return next(iter(sorted(path.glob("*.flac"))), None)
+        return next((item for item in sorted(path.iterdir()) if item.is_file() and item.suffix.lower() in {".flac", ".mp3"}), None)
     return None
 
 
 def first_cover_for_path(path: Path) -> Path | None:
-    directory = path.parent if path.is_file() else path
+    directory = path.parent if not path.is_dir() and path.suffix.lower() in {".flac", ".mp3"} else path
     if not directory.is_dir():
         return None
     for pattern in ("cover.jpg", "cover.jpeg", "cover.png", "cover.webp", "folder.jpg", "folder.png"):
@@ -1078,46 +1085,7 @@ def first_cover_for_path(path: Path) -> Path | None:
     for candidate in sorted(directory.iterdir()):
         if candidate.is_file() and candidate.stem.lower() in {"cover", "folder", "front"} and candidate.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
             return candidate
-    for candidate in sorted(directory.glob("cover.*")):
-        if candidate.is_file():
-            return candidate
     return None
-
-
-def recover_cover_from_qobuz(state: SyncState, kind: str, purchase_id: str, path: Path) -> Path | None:
-    """Fetch missing cover art for old downloads that predate artwork backfill."""
-    if kind not in {"album", "track"}:
-        return None
-    config = state.load_config()
-    if not config.is_configured:
-        return None
-    try:
-        client = SyncService(state)._build_client()
-        client.login(
-            user_id=config.qobuz_user_id,
-            user_auth_token=config.qobuz_user_auth_token,
-        )
-        client.download_owned_item_extras({"kind": kind, "id": purchase_id, "title": ""}, path)
-    except Exception:
-        return None
-    return first_cover_for_path(path)
-
-
-def cached_recover_cover(state: SyncState, kind: str, purchase_id: str, path: Path) -> Path | None:
-    """Recover cover art at most once per id to avoid hammering Qobuz's API.
-
-    Every miss is short-circuited for an hour so accidental or brute-forced
-    ``/art/...`` requests cannot trigger repeated authenticated Qobuz logins.
-    """
-    key = f"{kind}:{purchase_id}"
-    now = time.monotonic()
-    with _ART_RECOVERY_LOCK:
-        if _ART_RECOVERY_CACHE.get(key) is not None and now - _ART_RECOVERY_CACHE[key] < _ART_RECOVERY_TTL_SECONDS:
-            return first_cover_for_path(path)
-    art = recover_cover_from_qobuz(state, kind, purchase_id, path)
-    with _ART_RECOVERY_LOCK:
-        _ART_RECOVERY_CACHE[key] = time.monotonic()
-    return art
 
 
 def download_title(state: SyncState, kind: str, purchase_id: str) -> str:
@@ -1160,17 +1128,21 @@ def embedded_art_for_path(path: Path) -> tuple[bytes, str] | None:
     if flac is None:
         return None
     try:
-        from mutagen.flac import FLAC
+        from mutagen import File as MutagenFile
     except Exception:
         return None
     try:
-        audio = FLAC(flac)
+        audio = MutagenFile(flac)
     except Exception:
         return None
-    for picture in getattr(audio, "pictures", []) or []:
+    pictures = getattr(audio, "pictures", []) or []
+    if flac.suffix.lower() == ".mp3" and getattr(audio, "tags", None):
+        pictures = audio.tags.getall("APIC")
+    for picture in pictures:
         data = getattr(picture, "data", b"")
-        if data:
-            return bytes(data), str(getattr(picture, "mime", "image/jpeg") or "image/jpeg")
+        mime = getattr(picture, "mime", "")
+        if data and mime in {"image/jpeg", "image/png", "image/webp"}:
+            return bytes(data), mime
     return None
 
 
@@ -1205,6 +1177,7 @@ def progress_payload(state: SyncState) -> dict[str, object]:
     track_progress = build_track_progress_rows(state)
     strip_path = lambda rows: [{key: value for key, value in row.items() if key != "path"} for row in rows]
     return {
+        "busy": SYNC_JOB_LOCK.locked(),
         "progress": progress,
         "latest_sync": latest,
         "downloaded_total": state.count_downloads(),
@@ -1274,7 +1247,8 @@ def render_login(*, error: str = "") -> str:
     <h1>Qobuz Sync</h1>
     <p>Enter the access token to open the dashboard. Set <code>QOBUZ_SYNC_AUTH_TOKEN</code> on the service to change it.</p>
     {error_html}
-    <input name="token" type="password" autocomplete="current-password" placeholder="Access token" autofocus required>
+    <label for="access-token">Access token</label>
+    <input id="access-token" name="token" type="password" autocomplete="current-password" placeholder="Access token" autofocus required>
     <button type="submit">Unlock dashboard</button>
   </form>
 </body>

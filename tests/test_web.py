@@ -33,19 +33,10 @@ def test_status_page_loads_with_no_configuration(tmp_path, monkeypatch):
     assert "background-clip: padding-box" in response.text
     assert "contain: paint" in response.text
     assert 'id="sync-now-form"' in response.text
-    assert "event.preventDefault()" in response.text
-    assert "fetch(syncForm.action" in response.text
-    assert "startLiveRefresh()" in response.text
-    assert "const IDLE_REFRESH_MS = 8000" in response.text
-    assert "const ACTIVE_REFRESH_MS = 2000" in response.text
     assert 'id="last-sync-time"' in response.text
     assert 'id="sync-status-badge"' in response.text
-    assert 'id="sync-now-check"' in response.text
-    assert "setTimeout(() => syncCheck.classList.remove('visible'), 2000)" in response.text
     assert 'id="resync-all-form"' in response.text
     assert "Re Sync Entire Library" in response.text
-    assert "fetch(resyncForm.action" in response.text
-    assert 'id="resync-all-check"' in response.text
     assert "grid-template-columns: 1fr;" in response.text
     assert "font-size: clamp(2rem, 5.4vw, 3.7rem)" in response.text
     assert ".status-panel { grid-column: 1 / -1; padding: .8rem;" in response.text
@@ -233,20 +224,9 @@ def test_recent_downloads_split_artist_from_stored_title_when_metadata_missing(t
     assert "Unknown artist" not in home.text
 
 
-def test_recent_downloads_fill_missing_length_from_qobuz_metadata(tmp_path, monkeypatch):
+def test_recent_downloads_leave_missing_length_unknown_without_local_metadata(tmp_path, monkeypatch):
     monkeypatch.setenv("QOBUZ_SYNC_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr("qobuz_sync.web.media_metadata", lambda path: {})
-
-    class FakeQobuzClient:
-        def get_track(self, track_id):
-            return {
-                "title": "Ocean Drive",
-                "duration": 206,
-                "performer": {"name": "Duke Dumont"},
-                "album": {"title": "Ocean Drive", "artist": {"name": "Duke Dumont"}},
-            }
-
-    monkeypatch.setattr("qobuz_sync.web.logged_in_qobuz_client", lambda state: FakeQobuzClient())
     app = create_app()
     client = TestClient(app)
     from qobuz_sync.web import data_dir
@@ -258,8 +238,7 @@ def test_recent_downloads_fill_missing_length_from_qobuz_metadata(tmp_path, monk
 
     assert "<h3>Ocean Drive</h3>" in home.text
     assert "<p>Duke Dumont</p>" in home.text
-    assert "3:26" in home.text
-    assert "<span>—</span>" not in home.text
+    assert "<span>—</span>" in home.text
 
 
 def test_art_route_falls_back_to_embedded_flac_art(tmp_path, monkeypatch):
@@ -284,37 +263,9 @@ def test_art_route_falls_back_to_embedded_flac_art(tmp_path, monkeypatch):
     assert art.content == b"embedded-cover"
 
 
-def test_art_route_recovers_missing_cover_from_qobuz(tmp_path, monkeypatch):
+def test_art_route_uses_svg_fallback_when_local_cover_is_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("QOBUZ_SYNC_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr("qobuz_sync.web.embedded_art_for_path", lambda path: None)
-    music_dir = tmp_path / "music" / "song"
-    music_dir.mkdir(parents=True)
-    flac_path = music_dir / "song.flac"
-    flac_path.write_bytes(b"fake-flac")
-
-    def fake_recover(state, kind, purchase_id, path):
-        recovered = path.parent / "cover.jpg"
-        recovered.write_bytes(b"qobuz-cover")
-        return recovered
-
-    monkeypatch.setattr("qobuz_sync.web.recover_cover_from_qobuz", fake_recover)
-    app = create_app()
-    client = TestClient(app)
-    from qobuz_sync.web import data_dir
-    from qobuz_sync.state import SyncState
-    sync_state = SyncState(data_dir() / "qobuz-sync.db")
-    sync_state.mark_downloaded("track", "101", title="Recovered", path=str(flac_path))
-
-    art = client.get("/art/track/101")
-
-    assert art.status_code == 200
-    assert art.content == b"qobuz-cover"
-
-
-def test_art_route_uses_svg_fallback_when_cover_cannot_be_recovered(tmp_path, monkeypatch):
-    monkeypatch.setenv("QOBUZ_SYNC_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setattr("qobuz_sync.web.embedded_art_for_path", lambda path: None)
-    monkeypatch.setattr("qobuz_sync.web.recover_cover_from_qobuz", lambda state, kind, purchase_id, path: None)
     music_dir = tmp_path / "music" / "song"
     music_dir.mkdir(parents=True)
     flac_path = music_dir / "song.flac"

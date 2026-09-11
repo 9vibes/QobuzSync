@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,6 +12,7 @@ from typing import Any
 
 DEFAULT_DOWNLOAD_DIR = "/downloads"
 CLEARED_SENSITIVE_VALUE = str()
+_AUDIO_SUFFIXES = {".flac", ".mp3", ".m4a", ".wav", ".aif", ".aiff", ".ogg", ".opus"}
 
 
 @dataclass(frozen=True)
@@ -76,6 +80,12 @@ class SyncState:
         )
 
     def mark_downloaded(self, kind: str, purchase_id: str, *, title: str = "", path: str = "") -> None:
+        album_dir = Path(path)
+        audio_files = [
+            str(file.relative_to(album_dir))
+            for file in album_dir.rglob("*")
+            if file.suffix.lower() in _AUDIO_SUFFIXES and file.is_file()
+        ] if kind == "album" and path and album_dir.is_dir() else []
         with self._connect() as con:
             con.execute(
                 """
@@ -87,6 +97,11 @@ class SyncState:
                   downloaded_at=excluded.downloaded_at
                 """,
                 (kind, purchase_id, title, path),
+            )
+            con.execute("delete from download_files where kind=? and purchase_id=?", (kind, purchase_id))
+            con.executemany(
+                "insert into download_files(kind, purchase_id, relative_path) values(?, ?, ?)",
+                [(kind, purchase_id, file) for file in audio_files],
             )
 
     def is_downloaded(self, kind: str, purchase_id: str) -> bool:
@@ -106,18 +121,47 @@ class SyncState:
         return str(row["path"]) if row and row["path"] else None
 
     def plan_new_downloads(self, purchases: list[dict[str, str]]) -> list[dict[str, str]]:
-        plan: list[dict[str, str]] = []
-        for item in purchases:
-            path = self.downloaded_path(item["kind"], str(item["id"]))
-            if not path and self.is_downloaded(item["kind"], str(item["id"])):
+        purchase_keys = {(item["kind"], str(item["id"])) for item in purchases}
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                select d.kind, d.purchase_id, d.path, f.relative_path
+                from downloads d left join download_files f
+                  on d.kind=f.kind and d.purchase_id=f.purchase_id
+                """
+            ).fetchall()
+        records: dict[tuple[str, str], tuple[str, list[str]]] = {}
+        for row in rows:
+            _, files = records.setdefault((row["kind"], row["purchase_id"]), (row["path"], []))
+            if row["relative_path"] is not None:
+                files.append(row["relative_path"])
+        downloaded = set()
+        for key, (path, files) in records.items():
+            if key not in purchase_keys:
                 continue
-            if path and Path(path).is_file():
+            if not path:
+                downloaded.add(key)
                 continue
-            plan.append(item)
-        return plan
+            root = Path(path)
+            try:
+                if files:
+                    present = root.is_dir() and all(
+                        (root / file).is_file() and (root / file).stat().st_size > 0 for file in files
+                    )
+                elif root.is_file():
+                    present = root.stat().st_size > 0
+                else:
+                    # Legacy directories need one successful redownload to establish a manifest.
+                    present = False
+            except OSError:
+                present = False
+            if present:
+                downloaded.add(key)
+        return [item for item in purchases if (item["kind"], str(item["id"])) not in downloaded]
 
     def clear_downloads(self) -> None:
         with self._connect() as con:
+            con.execute("delete from download_files")
             con.execute("delete from downloads")
 
     def set_track_progress(
@@ -241,6 +285,12 @@ class SyncState:
                   downloaded_at text not null,
                   unique(kind, purchase_id)
                 );
+                create table if not exists download_files(
+                  kind text not null,
+                  purchase_id text not null,
+                  relative_path text not null,
+                  primary key(kind, purchase_id, relative_path)
+                );
                 create table if not exists sync_runs(
                   id integer primary key autoincrement,
                   started_at text not null,
@@ -274,9 +324,29 @@ class SyncState:
             con.execute("update config set value = ? where key = ?", (CLEARED_SENSITIVE_VALUE, "qobuz_password"))
             con.execute("update config set value = ? where key = ?", (CLEARED_SENSITIVE_VALUE, "qobuz_password_md5"))
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        # Create the DB privately; SQLite inherits its mode for new sidecars.
+        # Restrict existing sidecars too, without touching a possibly shared parent.
+        try:
+            self.db_path.touch(mode=0o600, exist_ok=False)
+        except FileExistsError:
+            pass
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            path = Path(f"{self.db_path}{suffix}")
+            try:
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    raise OSError(f"SQLite state path is not a regular file: {path}")
+                path.chmod(0o600, follow_symlinks=False)
+            except FileNotFoundError:
+                if not suffix:
+                    raise
         con = sqlite3.connect(self.db_path, timeout=30)
-        con.row_factory = sqlite3.Row
-        con.execute("pragma journal_mode=wal")
-        con.execute("pragma busy_timeout=30000")
-        return con
+        try:
+            con.row_factory = sqlite3.Row
+            con.execute("pragma journal_mode=wal")
+            con.execute("pragma busy_timeout=30000")
+            with con:
+                yield con
+        finally:
+            con.close()

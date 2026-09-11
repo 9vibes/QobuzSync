@@ -3,17 +3,16 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
+import time
 from pathlib import Path
 from typing import Callable, Protocol
 
 from .qobuz_client import QobuzClient, QobuzError, discover_web_credentials
-from .state import AppConfig, DEFAULT_DOWNLOAD_DIR, SyncState
+from .state import SyncState
 
 LOGGER = logging.getLogger(__name__)
-_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._() \-\[\]]+")
 _SENSITIVE_PARAM_RE = re.compile(
-    r"(user_auth_token|user_id|password|app_id|app_secret|seed|request_sig)=([^&\"'\\s]+)",
+    r"(user_auth_token|user_id|password|app_id|app_secret|seed|request_sig)=([^&\"'\s]+)",
     re.IGNORECASE,
 )
 
@@ -40,13 +39,19 @@ class SyncService:
         self.state = state
         self.client = client
 
-    def sync_once(self) -> dict[str, object]:
+    def sync_once(self, *, force_redownload: bool = False) -> dict[str, object]:
         config = self.state.load_config()
         if not config.is_configured:
             result = {"success": False, "found": 0, "downloaded": 0, "message": "Qobuz credentials are not configured"}
+            self.state.set_progress(phase="error", message="Qobuz credentials are not configured")
+            self.state.clear_track_progress()
             self.state.record_sync(**result)  # type: ignore[arg-type]
             return result
 
+        found = downloaded = 0
+        total_to_download = 0
+        failures: list[str] = []
+        dry_run = os.environ.get("QOBUZ_SYNC_DRY_RUN", "0") == "1"
         try:
             self.state.set_progress(phase="login", message="Signing in to Qobuz", current=0, total=0)
             client = self.client or self._build_client()
@@ -56,38 +61,16 @@ class SyncService:
             )
             self.state.set_progress(phase="discover", message="Reading purchased library", current=0, total=0)
             purchases = client.list_owned_items(include_albums=config.include_albums, include_tracks=config.include_tracks)
-            plan = self.state.plan_new_downloads(purchases)
+            found = len(purchases)
+            plan = purchases if force_redownload else self.state.plan_new_downloads(purchases)
+            planned_keys = {(item["kind"], str(item["id"])) for item in plan}
             if plan:
                 self.state.clear_track_progress()
             self.state.set_progress(phase="plan", message=f"Found {len(purchases)} purchases; {len(plan)} new downloads", current=0, total=len(plan))
-            if config.embed_art:
-                backfill_total = len(
-                    [
-                        item
-                        for item in purchases
-                        if item not in plan
-                        and (downloaded_path := self.state.downloaded_path(item["kind"], str(item["id"])))
-                        and Path(downloaded_path).is_file()
-                    ]
-                )
-                backfill_current = 0
-                for item in purchases:
-                    if item in plan:
-                        continue
-                    downloaded_path = self.state.downloaded_path(item["kind"], str(item["id"]))
-                    if downloaded_path and Path(downloaded_path).is_file():
-                        backfill_current += 1
-                        self.state.set_progress(
-                            phase="extras",
-                            message=f"Backfilling artwork/extras for {item.get('title', item['id'])}",
-                            current=backfill_current,
-                            total=backfill_total,
-                        )
-                        client.download_owned_item_extras(item, downloaded_path)
-            downloaded = 0
-            dry_run = os.environ.get("QOBUZ_SYNC_DRY_RUN", "0") == "1"
             total_to_download = len(plan)
             for item_index, item in enumerate(plan, start=1):
+                if dry_run:
+                    continue
                 self.state.set_progress(
                     phase="download",
                     message=f"Downloading {item.get('title', item['id'])}",
@@ -103,12 +86,17 @@ class SyncService:
                         total=total_to_download,
                     )
 
-                if dry_run:
-                    output_path = self._write_purchase_marker(config, item)
-                else:
-                    def track_progress(kind: str, purchase_id: str, title: str, path: str, downloaded_bytes: int, total_bytes: int, status: str) -> None:
-                        self.state.set_track_progress(kind, purchase_id, title=title, path=path, downloaded_bytes=downloaded_bytes, total_bytes=total_bytes, status=status)
+                progress_writes: dict[tuple[str, str], float] = {}
 
+                def track_progress(kind: str, purchase_id: str, title: str, path: str, downloaded_bytes: int, total_bytes: int, status: str) -> None:
+                    now = time.monotonic()
+                    key = (kind, purchase_id)
+                    # Never throttle terminal events, even if the last chunk just arrived.
+                    if status != "downloading" or now - progress_writes.get(key, float("-inf")) >= 0.5:
+                        self.state.set_track_progress(kind, purchase_id, title=title, path=path, downloaded_bytes=downloaded_bytes, total_bytes=total_bytes, status=status)
+                        progress_writes[key] = now
+
+                try:
                     output_path = client.download_owned_item(
                         item,
                         config.download_dir,
@@ -117,47 +105,53 @@ class SyncService:
                         progress_callback=album_progress,
                         track_progress_callback=track_progress,
                     )
-                self.state.mark_downloaded(item["kind"], str(item["id"]), title=item.get("title", ""), path=str(output_path))
-                downloaded += 1
+                    self.state.mark_downloaded(item["kind"], str(item["id"]), title=item.get("title", ""), path=str(output_path))
+                    downloaded += 1
+                except Exception as exc:
+                    message = _safe_message(exc)
+                    failures.append(message)
+                    LOGGER.error("Qobuz purchase download failed: %s", message)
+                    self.state.set_progress(phase="download", message=message, current=item_index, total=total_to_download)
+                    continue
                 self.state.set_progress(phase="download", message=f"Downloaded {item.get('title', item['id'])}", current=item_index, total=total_to_download)
-            result = {"success": True, "found": len(purchases), "downloaded": downloaded, "message": "Sync completed"}
-            self.state.set_progress(phase="complete", message="All Good!", current=total_to_download, total=total_to_download)
+
+            if config.embed_art and not dry_run:
+                paths = {(row["kind"], row["purchase_id"]): row["path"] for row in self.state.list_downloads(limit=-1)}
+                backfill = [
+                    (item, paths.get((item["kind"], str(item["id"])))) for item in purchases
+                    if (item["kind"], str(item["id"])) not in planned_keys
+                    and paths.get((item["kind"], str(item["id"])))
+                ]
+                for index, (item, path) in enumerate(backfill, start=1):
+                    self.state.set_progress(
+                        phase="extras", message=f"Backfilling artwork/extras for {item.get('title', item['id'])}",
+                        current=index, total=len(backfill),
+                    )
+                    try:
+                        client.download_owned_item_extras(item, path)
+                    except Exception as exc:
+                        LOGGER.warning("Qobuz artwork/extras backfill failed: %s", _safe_message(exc))
+
+            message = "Sync completed"
+            if dry_run:
+                message = f"Dry run: {total_to_download} purchases would be downloaded"
+            elif failures:
+                message = f"{len(failures)} purchase(s) failed: {'; '.join(failures)}"
+            result = {"success": not failures, "found": found, "downloaded": downloaded, "message": message}
+            self.state.set_progress(phase="error" if failures else "complete", message=message if failures or dry_run else "All Good!", current=total_to_download, total=total_to_download)
             self.state.clear_track_progress()
         except Exception as exc:
-            LOGGER.exception("Qobuz sync failed")
-            result = {"success": False, "found": 0, "downloaded": 0, "message": _safe_message(exc)}
-            self.state.set_progress(phase="error", message=_safe_message(exc), current=0, total=0)
+            LOGGER.error("Qobuz sync failed: %s", _safe_message(exc))
+            result = {"success": False, "found": found, "downloaded": downloaded, "message": _safe_message(exc)}
+            self.state.set_progress(phase="error", message=_safe_message(exc), current=downloaded, total=total_to_download)
             self.state.clear_track_progress()
 
         self.state.record_sync(**result)  # type: ignore[arg-type]
         return result
 
     def resync_entire_library(self) -> dict[str, object]:
-        """Delete existing downloaded files and download the full purchased library again."""
-        config = self.state.load_config()
-        if not config.is_configured:
-            result = {"success": False, "found": 0, "downloaded": 0, "message": "Qobuz credentials are not configured"}
-            self.state.record_sync(**result)  # type: ignore[arg-type]
-            return result
-        self.state.set_progress(phase="reset", message="Clearing existing downloaded library", current=0, total=0)
-        self._clear_download_dir(Path(config.download_dir))
-        self.state.clear_downloads()
-        self.state.clear_track_progress()
-        return self.sync_once()
-
-    @staticmethod
-    def _clear_download_dir(download_dir: Path) -> None:
-        """Remove only the contents of Qobuz Sync's fixed download directory."""
-        resolved = download_dir.resolve()
-        allowed = Path(DEFAULT_DOWNLOAD_DIR).resolve()
-        if resolved != allowed:
-            raise QobuzError(f"Refusing to clear unexpected download directory: {download_dir}")
-        resolved.mkdir(parents=True, exist_ok=True)
-        for child in resolved.iterdir():
-            if child.is_dir() and not child.is_symlink():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
+        """Redownload purchases, preserving existing files and records until replacement succeeds."""
+        return self.sync_once(force_redownload=True)
 
     def _build_client(self) -> QobuzClient:
         app_id = os.environ.get("QOBUZ_APP_ID")
@@ -169,18 +163,3 @@ class SyncService:
         if not app_id:
             raise QobuzError("Qobuz app id could not be discovered")
         return QobuzClient(app_id, secrets=secrets)
-
-    @staticmethod
-    def _write_purchase_marker(config: AppConfig, item: dict[str, str]) -> Path:
-        download_dir = Path(config.download_dir)
-        safe_title = _SAFE_NAME_RE.sub("_", item.get("title") or f"{item['kind']}-{item['id']}").strip()[:120]
-        folder = download_dir / "_qobuz-sync-pending"
-        folder.mkdir(parents=True, exist_ok=True)
-        marker = folder / f"{item['kind']}-{item['id']}-{safe_title}.txt"
-        marker.write_text(
-            "Qobuz Sync discovered this purchased item.\n"
-            "Audio download enablement requires live Qobuz account integration testing.\n"
-            f"Kind: {item['kind']}\nID: {item['id']}\nTitle: {item.get('title', '')}\n",
-            encoding="utf-8",
-        )
-        return marker

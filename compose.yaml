@@ -2,7 +2,7 @@ services:
   qobuz-sync:
     build: .
     ports:
-      - "23809:23809"
+      - "127.0.0.1:23809:23809"
     environment:
       QOBUZ_SYNC_DATA_DIR: /data
       QOBUZ_SYNC_BACKGROUND: "1"

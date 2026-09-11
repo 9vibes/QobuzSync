@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.50
+
+- Makes dashboard polling local-only, caches file metadata, and uses one non-overlapping browser polling loop with visible errors and session-expiry handling.
+- Fixes repeated album downloads with file manifests, paginates complete album/purchase listings, and continues syncing after individual purchase failures.
+- Uses atomic downloads and metadata updates, checks transfer sizes and basic audio signatures, and preserves existing archives during full resync.
+- Adds MP3 filenames and ID3 metadata/artwork support; avoids repeated writes of matching artwork and tags.
+- Serializes scheduled/manual jobs, recovers from worker failures, throttles progress writes, and closes SQLite connections explicitly.
+- Isolates API credentials from media requests, fixes log redaction, tightens database permissions, and restricts artwork responses to safe image types.
+- Validates settings, fixes account switching, improves mobile/keyboard feedback, and limits standalone Compose exposure to loopback by default.
+- Adds backend and optional real-browser regression coverage.
+- Older albums without file manifests receive a one-time verification redownload. Existing unmarked folders are preserved; replacement folders may have an album-ID suffix.
+
 ## 0.1.49
 
 - Removes the broken Qobuz email/password login flow from the UI and sync client.

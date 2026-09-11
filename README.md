@@ -39,18 +39,33 @@ Qobuz Sync uses your existing Qobuz Web Player browser session. Email/password A
 
 Manual fallback: open Storage / Local Storage, find `localuser`, then copy `token` and `id` into the separate token fields.
 
+## Archive safety
+
+- Normal sync skips completed downloads and detects missing files using an album file manifest.
+- Albums saved by older releases receive one verification redownload to establish that manifest. Unmarked, nonempty legacy folders are preserved; replacements may use an album-ID suffix to avoid overwriting another edition.
+- **Re Sync Entire Library** redownloads the selected purchases without first deleting the library. Each file is replaced only after its transfer succeeds and its basic audio signature is checked. This is not a full audio integrity/decode check.
+- Dry runs only discover purchases; they never create completed-download records or replace audio.
+- Artwork and metadata repair runs during sync, not while viewing the dashboard. Missing local artwork gets a placeholder until the next repair.
+- Keep backups. Atomic per-file replacement does not make a whole multi-track album transactionally replaceable, and changed metadata or quality can leave older files alongside new ones.
+
+## Deployment
+
+The standalone Compose file binds to `127.0.0.1:23809` by default. Before exposing it to your network, configure `QOBUZ_SYNC_AUTH_TOKEN` or put it behind an authenticating reverse proxy. Without a token, the app intentionally trusts the Umbrel proxy and does not authenticate direct clients.
+
+Run one application process per library. Scheduled and manual jobs share a process-local lock; multiple workers or containers must not write to the same library. Configure forwarded headers only for trusted reverse proxies so HTTPS cookies and same-origin checks use the external scheme and host.
+
 ## Development
 
 Run tests:
 
 ```bash
-uv run pytest
+uv run --extra dev python -m pytest
 ```
 
 Run locally:
 
 ```bash
-QOBUZ_SYNC_DATA_DIR=./data QOBUZ_SYNC_BACKGROUND=1 uv run python -m qobuz_sync
+QOBUZ_SYNC_DATA_DIR=./data WEB_HOST=127.0.0.1 QOBUZ_SYNC_BACKGROUND=1 uv run python -m qobuz_sync
 ```
 
 Or with Docker:
@@ -58,6 +73,8 @@ Or with Docker:
 ```bash
 docker compose up --build
 ```
+
+Browser regression tests are optional and skip when Playwright or Chromium is unavailable. Install Python Playwright and Chromium to exercise polling, keyboard navigation, and 320px/375px/1280px layouts. On Alpine, use the system Node runtime with `PLAYWRIGHT_NODEJS_PATH=/usr/bin/node`.
 
 Container image:
 
